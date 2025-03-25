@@ -67,7 +67,10 @@ def cpp_format(template: str, keys: Dict[str, Any]) -> str:
     # We don't use `str.format` because it's not safe for C++ {} braces
     new_template = copy.deepcopy(template)
     for key, value in keys.items():
-        new_template = new_template.replace(f'{{{key}}}', f'{value}')
+        value_str = str(value)
+        if isinstance(value, bool):
+            value_str = value_str.lower()
+        new_template = new_template.replace(f'{{{key}}}', f'{value_str}')
     return new_template
 
 

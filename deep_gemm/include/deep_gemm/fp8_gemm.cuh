@@ -31,7 +31,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup,
-          uint32_t kNumTMAMulticast,
+          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           GemmType kGemmType>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
@@ -146,7 +146,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA>(shape_m, grouped_layout);
 
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
@@ -161,6 +161,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
+                    // Assign TMA multicast number into A and B
+                    constexpr int kNumTMAMulticastOnA = kIsTMAMulticastOnA ? kNumTMAMulticast : 1;
+                    constexpr int kNumTMAMulticastOnB = kIsTMAMulticastOnA ? 1 : kNumTMAMulticast;
+
                     // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
                     // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
                     #pragma unroll
@@ -168,18 +172,18 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         // Wait consumer release
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
-                        // Issue TMA A with broadcasting
+                        // Issue TMA A
                         auto& full_barrier = *full_barriers[s];
                         int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                        tma_copy<kNumTMAMulticast>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                   smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
-                        tma_copy<kNumTMAMulticast>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                   smem_scales_a[s], m_block_idx * BLOCK_M,
-                                                   scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
+                        tma_copy<kNumTMAMulticastOnA>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                      smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
+                        tma_copy<kNumTMAMulticastOnA>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                      smem_scales_a[s], m_block_idx * BLOCK_M,
+                                                      scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
 
-                        // Issue TMA B without broadcasting
-                        tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                 smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        // Issue TMA B
+                        tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                      smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
@@ -347,7 +351,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
-          uint32_t kNumTMAMulticast,
+          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           GemmType kGemmType>
 class Gemm {
 private:
@@ -369,7 +373,7 @@ public:
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
         auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                       kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
-                                      kNumTMAMulticast, kGemmType>;
+                                      kNumTMAMulticast, kIsTMAMulticastOnA, kGemmType>;
         DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
 
         // Cluster launch
