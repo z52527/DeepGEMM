@@ -28,21 +28,21 @@ DeepGEMM does not behave very well on some shapes, optimization PRs are welcomed
 | 128  | 7168  | 16384 | 645 TFLOPS  |    2604 GB/s     |  1.4x   |
 | 128  | 4096  | 7168  | 533 TFLOPS  |    2221 GB/s     |  2.0x   |
 | 128  | 7168  | 2048  | 510 TFLOPS  |    2277 GB/s     |  1.7x   |
-| 4096 | 2112  | 7168  | 1058 TFLOPS |     527 GB/s     |  1.1x   |
-| 4096 | 24576 | 1536  | 990 TFLOPS  |     786 GB/s     |  1.0x   |
-| 4096 | 32768 |  512  | 590 TFLOPS  |    1232 GB/s     |  1.0x   |
-| 4096 | 7168  | 16384 | 1358 TFLOPS |     343 GB/s     |  1.2x   |
-| 4096 | 4096  | 7168  | 1304 TFLOPS |     500 GB/s     |  1.1x   |
-| 4096 | 7168  | 2048  | 1025 TFLOPS |     697 GB/s     |  1.1x   |
+| 4096 | 2112  | 7168  | 1009 TFLOPS |     503 GB/s     |  1.1x   |
+| 4096 | 24576 | 1536  | 1125 TFLOPS |     893 GB/s     |  1.1x   |
+| 4096 | 32768 |  512  | 751 TFLOPS  |    1569 GB/s     |  1.1x   |
+| 4096 | 7168  | 16384 | 1426 TFLOPS |     361 GB/s     |  1.3x   |
+| 4096 | 4096  | 7168  | 1265 TFLOPS |     485 GB/s     |  1.2x   |
+| 4096 | 7168  | 2048  | 1168 TFLOPS |     794 GB/s     |  1.2x   |
 
 ### Grouped GEMMs for MoE models (contiguous layout)
 
 | #Groups | M per group |  N   |  K   | Computation | Memory bandwidth | Speedup |
 |:-------:|:-----------:|:----:|:----:|:-----------:|:----------------:|:-------:|
-|    4    |    8192     | 4096 | 7168 | 1297 TFLOPS |     418 GB/s     |  1.2x   |
-|    4    |    8192     | 7168 | 2048 | 1099 TFLOPS |     681 GB/s     |  1.2x   |
-|    8    |    4096     | 4096 | 7168 | 1288 TFLOPS |     494 GB/s     |  1.2x   |
-|    8    |    4096     | 7168 | 2048 | 1093 TFLOPS |     743 GB/s     |  1.1x   |
+|    4    |    8192     | 4096 | 7168 | 1346 TFLOPS |     434 GB/s     |  1.3x   |
+|    4    |    8192     | 7168 | 2048 | 1214 TFLOPS |     752 GB/s     |  1.3x   |
+|    8    |    4096     | 4096 | 7168 | 1346 TFLOPS |     516 GB/s     |  1.3x   |
+|    8    |    4096     | 7168 | 2048 | 1214 TFLOPS |     826 GB/s     |  1.2x   |
 
 ### Grouped GEMMs for MoE models (masked layout)
 
