@@ -1,3 +1,4 @@
+import math
 import torch
 from typing import Tuple
 
@@ -15,9 +16,10 @@ constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
+constexpr auto kIsTMAMulticastOnA = {IS_TMA_MULTICAST_ON_A};
 
 // Make a templated GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
+using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::Normal>;
 
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
@@ -31,10 +33,10 @@ GemmType::run(out, rhs_scales, nullptr,
 """
 
 
-def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
+def is_tma_multicast_legal(shape_dim: int, block_dim: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
-    return (n % (block_n * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
+    return (shape_dim % (block_dim * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
 
 
 def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
@@ -56,13 +58,13 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
 
 
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int, int]:
+                     is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, Tuple[int, bool], int]:
     if not is_grouped_contiguous:
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
-    block_ns = tuple(range(16, 129, 8))
+    block_ns = tuple(range(16, 129, 8)) + (144, 160, )
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -89,26 +91,38 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
-    for num_stages in (6, 5, 4) if 128 % best_block_n != 0 else (8, 7, 6, 5, 4):
+    stage_candidates = (8, 7, 6, 5, 4)
+    if 128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4:
+        # Unrolling both stages and `num_former_iters` will cause large code size
+        stage_candidates = (4, )
+    for num_stages in stage_candidates:
         best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
             break
     assert best_num_stages is not None
 
-    # Decide the number of TMA multicast
-    best_num_tma_multicast = 1
-    if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
-        best_num_tma_multicast = 2
+    # Decide the number of TMA multicast and whether broadcast on A
+    best_tma_multicast_config = (1, True)
+
+    # Try to multicast on the larger block side first
+    is_multicast_legal = {
+        'A': is_tma_multicast_legal(n, best_block_n, 2, num_sms),
+        'B': is_tma_multicast_legal(m, best_block_m, 2, num_sms),
+    }
+    for i in ('A', 'B') if best_block_m > best_block_n else ('B', 'A'):
+        if m >= 512 and is_multicast_legal[i] and num_groups == 1:
+            best_tma_multicast_config = (2, i == 'A')
+            break
 
     # Recompute the minimal number of SMs required
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
     num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
-    num_min_sms = ceil_div(max(num_min_sms, num_sms - 8), best_num_tma_multicast) * best_num_tma_multicast
-    assert num_min_sms <= num_sms and is_tma_multicast_legal(n, best_block_n, best_num_tma_multicast, num_min_sms)
+    num_min_sms = ceil_div(max(num_min_sms, num_sms - 8), best_tma_multicast_config[0]) * best_tma_multicast_config[0]
+    assert num_min_sms <= num_sms
 
-    return num_min_sms, best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
+    return num_min_sms, best_block_m, best_block_n, best_num_stages, best_tma_multicast_config, best_smem_size
 
 
 def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -158,12 +172,14 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast},
+              'NUM_STAGES': num_stages,
+              'NUM_TMA_MULTICAST': tma_multicast_config[0],
+              'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
