@@ -152,7 +152,7 @@ The [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide
 
 - TMA load for LHS, LHS scaling factors, and RHS matrices
 - TMA store for the output matrix
-- TMA multicast (exclusive to the LHS matrix)
+- TMA multicast (automatically decide LHS or RHS to broadcast)
 - TMA descriptor prefetching
 
 #### Common detail optimizations
