@@ -27,7 +27,7 @@ __device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
+template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup,
@@ -41,9 +41,13 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 const __grid_constant__ CUtensorMap tensor_map_scales_a,
                 const __grid_constant__ CUtensorMap tensor_map_d) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
+    // Currently, only BLOCK_N size of 160 is classified as a largeBlockTile configuration in our optimization framework. 
+    constexpr bool largeBlockTile = (BLOCK_N == 160);
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
+    if constexpr(!largeBlockTile) {
+        DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
+    }
 
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
@@ -146,205 +150,760 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, grouped_layout);
 
-    if (threadIdx.x >= kNumMathThreads) {
-        // TMA warp-group for loading data
-        cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+    if constexpr (largeBlockTile) {
+        auto scheduler = SchedulerLargeBlockTile<kGemmType, SHAPE_M, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(SHAPE_N, grouped_layout);
+        if (threadIdx.x >= kNumMathThreads) {
+            // TMA warp-group for loading data
+            cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
 
-        // NOTES: only one thread (or warp) will be used
-        if (threadIdx.x == kNumMathThreads) {
+            // NOTES: only one thread (or warp) will be used
+            if (threadIdx.x == kNumMathThreads) {
+                // Persistently schedule over blocks
+                while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                    launch_k_iterations([&](int k_iter, auto type) {
+                        constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                        constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                        DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+
+                        // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
+                        // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
+                        #pragma unroll
+                        for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
+                            // Wait consumer release
+                            empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+
+                            auto& full_barrier = *full_barriers[s];
+                            int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+
+                            // Issue TMA A without broadcasting
+                            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                    smem_a[s], k_idx, scheduler.get_global_idx(SHAPE_M, BLOCK_M, m_block_idx));
+                            tma_copy(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                    smem_scales_a[s], m_block_idx * BLOCK_M,
+                                                    scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
+
+                            // Issue TMA B with broadcasting
+                            tma_copy<kNumTMAMulticast>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                    smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+
+                            full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
+                        }
+
+                        // Wait unaligned cases
+                        #pragma unroll
+                        for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                            empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                            full_barriers[s]->arrive();
+                        }
+                    });
+                }
+
+                // To safely deconstruct distributed shared barriers, we need another round of empty waits
+                if constexpr (kNumTMAMulticast > 1) {
+                    #pragma unroll
+                    for (uint32_t s = 0; s < kNumStages; ++ s)
+                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + 1) & 1);
+                }
+            }
+        } else {
+            // Math warp-groups for WGMMA
+            cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+
+            // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
+            const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
+            const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
+
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                // Decide the number of scales B to load
+                DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
+                uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
+                if constexpr (not kMustUseUniformedScaleB) {
+                    num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
+                    num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
+                }
+                uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
+                // Accumulation for WGMMA or CUDA promotion
+                float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
+                // Empty barrier arrival
+                auto empty_barrier_arrive = [&](int s) {
+                    if constexpr (kNumTMAMulticast == 1) {
+                        lane_idx == 0 ? empty_barriers[s]->arrive() : void();
+                    } else {
+                        lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(lane_idx) : void();
+                    }
+                };
+                // To ensure optimal performance, conditional checks must never be placed inside the loop body of kNumInnerStages.
+                switch (n_block_idx % 4) {
+                    case 0:
+                        // Load B scales with math warp-groups
+                        // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+                        if (threadIdx.x >= 32) {
+                            auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+                            auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+                            #pragma unroll
+                            for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                                st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                        }
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Launch MMAs
+                        launch_k_iterations([&](int k_iter, auto type) {
+                            constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                            constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                            DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                            #pragma unroll
+                            for (int s = 0; s < kNumInnerStages; ++ s) {
+                                // Read B scales
+                                float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
+                                // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+
+                                // Wait TMA arrivals
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+
+                                // Read A scales
+                                // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                                auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
+
+                                // Commit WGMMA instructions
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_arrive();
+                                #pragma unroll
+                                for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                                    auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+                                    auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                                    WGMMA::wgmma(desc_a, desc_b, accum, k);
+                                }
+                                warpgroup_commit_batch();
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_wait<0>();
+
+                                // Notify barrier arrival
+                                empty_barrier_arrive(s);
+                                // Promote with scales
+                                // NOTES: making it as predicates is very important for performance, comparing to two loops
+                                float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                                float scale_0_1, scale_1_1;
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                                // In performance-critical code paths, we rigorously avoid branching logic and unnecessary instructions. 
+                                // Here, we adopt a brute-force approach by explicitly unrolling computations for all possible scenarios.
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum / 4 / 5 * 4; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_0 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_0 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_0 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_0 * accum[i * 4 + 3];
+                                }
+                                #pragma unroll
+                                for (int i = WGMMA::kNumAccum / 4 / 5 * 4; i < WGMMA::kNumAccum / 4; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_1 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_1 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_1 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_1 * accum[i * 4 + 3];
+                                }
+                            }
+                            
+                            // Wait unaligned cases
+                            #pragma unroll
+                            for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                                empty_barrier_arrive(s);
+                            }
+                        });
+
+                        // Write back to shared memory using STSM
+                        DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+                        #pragma unroll
+                        for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                            SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16)
+                            );
+                        }
+                        if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                            SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16
+                            );
+                        }
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Use TMA store to write back to global memory
+                        if (threadIdx.x == 0) {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N,
+                                                        scheduler.get_global_idx(SHAPE_M, BLOCK_M, m_block_idx));
+                            cute::tma_store_arrive();
+                            cute::tma_store_wait<0>();
+                        }
+                        __syncwarp();
+                        break;
+                    case 1:
+                        // Load B scales with math warp-groups
+                        // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+                        if (threadIdx.x >= 32) {
+                            auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+                            auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+                            #pragma unroll
+                            for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                                st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                        }
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+
+                        // Launch MMAs
+                        launch_k_iterations([&](int k_iter, auto type) {
+                            constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                            constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                            DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                            #pragma unroll
+                            for (int s = 0; s < kNumInnerStages; ++ s) {
+                                // Read B scales
+                                float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
+                                // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+
+                                // Wait TMA arrivals
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+
+                                // Read A scales
+                                // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                                auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
+
+                                // Commit WGMMA instructions
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_arrive();
+                                #pragma unroll
+                                for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                                    auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+                                    auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                                    WGMMA::wgmma(desc_a, desc_b, accum, k);
+                                }
+                                warpgroup_commit_batch();
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_wait<0>();
+
+                                // Notify barrier arrival
+                                empty_barrier_arrive(s);
+                                // Promote with scales
+                                // NOTES: making it as predicates is very important for performance, comparing to two loops
+                                float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                                float scale_0_1, scale_1_1;
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                                
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum / 4 / 5 * 3; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_0 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_0 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_0 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_0 * accum[i * 4 + 3];
+                                }
+                                #pragma unroll
+                                for (int i = WGMMA::kNumAccum / 4 / 5 * 3; i < WGMMA::kNumAccum / 4; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_1 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_1 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_1 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_1 * accum[i * 4 + 3];
+                                }
+                            }
+                            
+
+                            // Wait unaligned cases
+                            #pragma unroll
+                            for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                                empty_barrier_arrive(s);
+                            }
+                        });
+
+                        // Write back to shared memory using STSM
+                        DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+                        #pragma unroll
+                        for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                            SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16)
+                            );
+                        }
+                        if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                            SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16
+                            );
+                        }
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Use TMA store to write back to global memory
+                        if (threadIdx.x == 0) {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N,
+                                                        scheduler.get_global_idx(SHAPE_M, BLOCK_M, m_block_idx));
+                            cute::tma_store_arrive();
+                            cute::tma_store_wait<0>();
+                        }
+                        __syncwarp();
+                        break;
+                    case 2:
+                        // Load B scales with math warp-groups
+                        // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+                        if (threadIdx.x >= 32) {
+                            auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+                            auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+                            #pragma unroll
+                            for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                                st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                        }
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Launch MMAs
+                        launch_k_iterations([&](int k_iter, auto type) {
+                            constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                            constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                            DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                            #pragma unroll
+                            for (int s = 0; s < kNumInnerStages; ++ s) {
+                                // Read B scales
+                                float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
+                                // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+
+                                // Wait TMA arrivals
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+
+                                // Read A scales
+                                // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                                auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
+
+                                // Commit WGMMA instructions
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_arrive();
+                                #pragma unroll
+                                for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                                    auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+                                    auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                                    WGMMA::wgmma(desc_a, desc_b, accum, k);
+                                }
+                                warpgroup_commit_batch();
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_wait<0>();
+
+                                // Notify barrier arrival
+                                empty_barrier_arrive(s);
+                                // Promote with scales
+                                // NOTES: making it as predicates is very important for performance, comparing to two loops
+                                float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                                float scale_0_1, scale_1_1;
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                                
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum / 4 / 5 * 2; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_0 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_0 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_0 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_0 * accum[i * 4 + 3];
+                                }
+                                #pragma unroll
+                                for (int i = WGMMA::kNumAccum / 4 / 5 * 2; i < WGMMA::kNumAccum / 4; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_1 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_1 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_1 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_1 * accum[i * 4 + 3];
+                                }
+                            }
+                            
+
+                            // Wait unaligned cases
+                            #pragma unroll
+                            for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                                empty_barrier_arrive(s);
+                            }
+                        });
+
+                        // Write back to shared memory using STSM
+                        DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+                        #pragma unroll
+                        for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                            SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16)
+                            );
+                        }
+                        if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                            SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16
+                            );
+                        }
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Use TMA store to write back to global memory
+                        if (threadIdx.x == 0) {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N,
+                                                        scheduler.get_global_idx(SHAPE_M, BLOCK_M, m_block_idx));
+                            cute::tma_store_arrive();
+                            cute::tma_store_wait<0>();
+                        }
+                        __syncwarp();
+                        break;
+                    case 3:
+                        // Load B scales with math warp-groups
+                        // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+                        if (threadIdx.x >= 32) {
+                            auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+                            auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+                            #pragma unroll
+                            for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                                st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                        }
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Launch MMAs
+                        launch_k_iterations([&](int k_iter, auto type) {
+                            constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                            constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                            DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                            #pragma unroll
+                            for (int s = 0; s < kNumInnerStages; ++ s) {
+                                // Read B scales
+                                float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
+                                // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
+
+                                // Wait TMA arrivals
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+
+                                // Read A scales
+                                // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                                auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
+
+                                // Commit WGMMA instructions
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_arrive();
+                                #pragma unroll
+                                for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                                    auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+                                    auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                                    WGMMA::wgmma(desc_a, desc_b, accum, k);
+                                }
+                                warpgroup_commit_batch();
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                                    warpgroup_fence_operand(accum[i]);
+                                warpgroup_wait<0>();
+
+                                // Notify barrier arrival
+                                empty_barrier_arrive(s);
+                                // Promote with scales
+                                // NOTES: making it as predicates is very important for performance, comparing to two loops
+                                float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                                float scale_0_1, scale_1_1;
+                                if constexpr (not kMustUseUniformedScaleB)
+                                    scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                                
+                                #pragma unroll
+                                for (int i = 0; i < WGMMA::kNumAccum / 4 / 5 * 1; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_0 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_0 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_0 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_0 * accum[i * 4 + 3];
+                                }
+                                #pragma unroll
+                                for (int i = WGMMA::kNumAccum / 4 / 5 * 1; i < WGMMA::kNumAccum / 4; ++ i) {
+                                    final_accum[i * 4 + 0] += scale_0_1 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] += scale_0_1 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] += scale_1_1 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] += scale_1_1 * accum[i * 4 + 3];
+                                }
+                            }
+                            
+
+                            // Wait unaligned cases
+                            #pragma unroll
+                            for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                                full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                                empty_barrier_arrive(s);
+                            }
+                        });
+
+                        // Write back to shared memory using STSM
+                        DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
+                        #pragma unroll
+                        for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                            SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                                __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16)
+                            );
+                        }
+                        if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                            SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                                __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                                smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16
+                            );
+                        }
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                        // Use TMA store to write back to global memory
+                        if (threadIdx.x == 0) {
+                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N,
+                                                        scheduler.get_global_idx(SHAPE_M, BLOCK_M, m_block_idx));
+                            cute::tma_store_arrive();
+                            cute::tma_store_wait<0>();
+                        }
+                        __syncwarp();
+                        break;
+                    default:
+
+                        break;
+                }
+            }
+        }
+    } else {
+        auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, grouped_layout);
+        if (threadIdx.x >= kNumMathThreads) {
+            // TMA warp-group for loading data
+            cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+
+            // NOTES: only one thread (or warp) will be used
+            if (threadIdx.x == kNumMathThreads) {
+                // Persistently schedule over blocks
+                while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                    launch_k_iterations([&](int k_iter, auto type) {
+                        constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                        constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                        DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+
+                        // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
+                        // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
+                        #pragma unroll
+                        for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
+                            // Wait consumer release
+                            empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+
+                            auto& full_barrier = *full_barriers[s];
+                            int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+
+                            // Issue TMA A with broadcasting
+                            tma_copy<kNumTMAMulticast>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                    smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
+                            tma_copy<kNumTMAMulticast>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                    smem_scales_a[s], m_block_idx * BLOCK_M,
+                                                    scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
+
+                            // Issue TMA B without broadcasting
+                            tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                    smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+
+                            full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
+                        }
+
+                        // Wait unaligned cases
+                        #pragma unroll
+                        for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                            empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                            full_barriers[s]->arrive();
+                        }
+                    });
+                }
+
+                // To safely deconstruct distributed shared barriers, we need another round of empty waits
+                if constexpr (kNumTMAMulticast > 1) {
+                    #pragma unroll
+                    for (uint32_t s = 0; s < kNumStages; ++ s)
+                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + 1) & 1);
+                }
+            }
+        } else {
+            // Math warp-groups for WGMMA
+            cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+
+            // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
+            const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
+            const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
+
+            // Persistently schedule over blocks
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                // Decide the number of scales B to load
+                DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
+                uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
+                if constexpr (not kMustUseUniformedScaleB) {
+                    num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
+                    num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
+                }
+                uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
+
+                
+                // Load B scales with math warp-groups
+                // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+                if (threadIdx.x >= 32) {
+                    auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
+                    auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
+                    #pragma unroll
+                    for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
+                        st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
+                }
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+
+                // Accumulation for WGMMA or CUDA promotion
+                float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
+
+                // Empty barrier arrival
+                auto empty_barrier_arrive = [&](int s) {
+                    if constexpr (kNumTMAMulticast == 1) {
+                        lane_idx == 0 ? empty_barriers[s]->arrive() : void();
+                    } else {
+                        lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(lane_idx) : void();
+                    }
+                };
+
+                // Launch MMAs
                 launch_k_iterations([&](int k_iter, auto type) {
                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
                     constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
-                    // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
-                    // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
                     #pragma unroll
-                    for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                        // Wait consumer release
-                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                    for (int s = 0; s < kNumInnerStages; ++ s) {
+                        // Read B scales
+                        float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
+                        // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
+                        if constexpr (not kMustUseUniformedScaleB)
+                            scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
-                        // Issue TMA A with broadcasting
-                        auto& full_barrier = *full_barriers[s];
-                        int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                        tma_copy<kNumTMAMulticast>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                   smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
-                        tma_copy<kNumTMAMulticast>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                   smem_scales_a[s], m_block_idx * BLOCK_M,
-                                                   scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
+                        // Wait TMA arrivals
+                        full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
-                        // Issue TMA B without broadcasting
-                        tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                 smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
-                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
+                        // Read A scales
+                        // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                        auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
+
+                        // Commit WGMMA instructions
+                        #pragma unroll
+                        for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                            warpgroup_fence_operand(accum[i]);
+                        warpgroup_arrive();
+                        #pragma unroll
+                        for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                            auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+                            auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                            WGMMA::wgmma(desc_a, desc_b, accum, k);
+                        }
+                        warpgroup_commit_batch();
+                        #pragma unroll
+                        for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                            warpgroup_fence_operand(accum[i]);
+                        warpgroup_wait<0>();
+
+                        // Notify barrier arrival
+                        empty_barrier_arrive(s);
+
+                        // Promote with scales
+                        // NOTES: making it as predicates is very important for performance, comparing to two loops
+                        float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                        float scale_0_1, scale_1_1;
+                        if constexpr (not kMustUseUniformedScaleB)
+                            scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                        #pragma unroll
+                        for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                            bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                            final_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                            final_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                            final_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                            final_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                        }
                     }
 
                     // Wait unaligned cases
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
-                        full_barriers[s]->arrive();
+                        full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
+                        empty_barrier_arrive(s);
                     }
                 });
-            }
 
-            // To safely deconstruct distributed shared barriers, we need another round of empty waits
-            if constexpr (kNumTMAMulticast > 1) {
+                // Write back to shared memory using STSM
+                DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
                 #pragma unroll
-                for (uint32_t s = 0; s < kNumStages; ++ s)
-                    empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + 1) & 1);
-            }
-        }
-    } else {
-        // Math warp-groups for WGMMA
-        cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
-
-        // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
-        const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
-        const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
-
-        // Persistently schedule over blocks
-        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            // Decide the number of scales B to load
-            DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
-            uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
-            if constexpr (not kMustUseUniformedScaleB) {
-                num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
-                num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
-            }
-            uint32_t num_scales_b = SHAPE_K_SCALES * (num_former_iters >= num_full_iters ? 1 : 2);
-
-            // Load B scales with math warp-groups
-            // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
-            if (threadIdx.x >= 32) {
-                auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
-                auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
-                #pragma unroll
-                for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
-                    st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
-            }
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-
-            // Accumulation for WGMMA or CUDA promotion
-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
-
-            // Empty barrier arrival
-            auto empty_barrier_arrive = [&](int s) {
-                if constexpr (kNumTMAMulticast == 1) {
-                    lane_idx == 0 ? empty_barriers[s]->arrive() : void();
-                } else {
-                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(lane_idx) : void();
+                for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                    SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
+                        __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
+                        smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16)
+                    );
                 }
-            };
-
-            // Launch MMAs
-            launch_k_iterations([&](int k_iter, auto type) {
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
-                DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
-
-                #pragma unroll
-                for (int s = 0; s < kNumInnerStages; ++ s) {
-                    // Read B scales
-                    float scale_b_0 = ld_shared(smem_scales_b + k_iter * kNumStages + s), scale_b_1;
-                    // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
-                    if constexpr (not kMustUseUniformedScaleB)
-                        scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
-
-                    // Wait TMA arrivals
-                    full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
-
-                    // Read A scales
-                    // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
-                    auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
-
-                    // Commit WGMMA instructions
-                    #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum; ++ i)
-                        warpgroup_fence_operand(accum[i]);
-                    warpgroup_arrive();
-                    #pragma unroll
-                    for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
-                        auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
-                        auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
-                        WGMMA::wgmma(desc_a, desc_b, accum, k);
-                    }
-                    warpgroup_commit_batch();
-                    #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum; ++ i)
-                        warpgroup_fence_operand(accum[i]);
-                    warpgroup_wait<0>();
-
-                    // Notify barrier arrival
-                    empty_barrier_arrive(s);
-
-                    // Promote with scales
-                    // NOTES: making it as predicates is very important for performance, comparing to two loops
-                    float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
-                    float scale_0_1, scale_1_1;
-                    if constexpr (not kMustUseUniformedScaleB)
-                        scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
-                    #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                        bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
-                        final_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                        final_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                        final_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                        final_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
-                    }
+                if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                    SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                        __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                        smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16
+                    );
                 }
+                cute::tma_store_fence();
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
-                // Wait unaligned cases
-                #pragma unroll
-                for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                    full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
-                    empty_barrier_arrive(s);
+                // Use TMA store to write back to global memory
+                if (threadIdx.x == 0) {
+                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N,
+                                                scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
                 }
-            });
-
-            // Write back to shared memory using STSM
-            DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
-            #pragma unroll
-            for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
-                SM90_U32x4_STSM_N<nv_bfloat162>::copy(
-                    __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
-                    smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + i * 16 + 8 * (lane_idx / 16)
-                );
+                __syncwarp();
             }
-            if constexpr (WGMMA::kNumAccum % 8 != 0) {
-                SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                    __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
-                    __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
-                    smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16
-                );
-            }
-            cute::tma_store_fence();
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-
-            // Use TMA store to write back to global memory
-            if (threadIdx.x == 0) {
-                cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N,
-                                              scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
-                cute::tma_store_arrive();
-                cute::tma_store_wait<0>();
-            }
-            __syncwarp();
         }
     }
+
+
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
 }
 
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
+template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAMulticast,
@@ -367,7 +926,7 @@ public:
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
+        auto kernel = fp8_gemm_kernel<SHAPE_M, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                       kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
                                       kNumTMAMulticast, kGemmType>;
         DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
