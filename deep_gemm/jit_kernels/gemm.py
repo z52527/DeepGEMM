@@ -106,7 +106,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         'B': is_tma_multicast_legal(m, best_block_m, 2, num_sms),
     }
     for i in ('A', 'B') if best_block_m > best_block_n else ('B', 'A'):
-        if m >= 1024 and is_multicast_legal[i] and num_groups == 1:
+        if m >= 512 and is_multicast_legal[i] and num_groups == 1:
             best_tma_multicast_config = (2, i == 'A')
             break
 
