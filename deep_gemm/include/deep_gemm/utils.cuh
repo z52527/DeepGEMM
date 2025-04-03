@@ -48,6 +48,6 @@ __device__ __host__ constexpr T ceil_div(T a, T b) {
 }
 
 template <typename T>
-__device__ __host__ constexpr T gcd(T a, T b) {
-    return b == 0 ? a : gcd(b, a % b);
+__device__ __host__ constexpr T constexpr_gcd(T a, T b) {
+    return b == 0 ? a : constexpr_gcd(b, a % b);
 }
