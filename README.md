@@ -128,6 +128,7 @@ The library also provides some environment variables, which may be useful:
 
 - `DG_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
 - `DG_NVCC_COMPILER`: string, specified NVCC compiler path; will find in `from torch.utils.cpp_extension.CUDA_HOME` by default
+- `DG_NVCC_OVERRIDE_CPP_STANDARD`: integer (e.g., `20`), support for some old version GCC compiler
 - `DG_DISABLE_FFMA_INTERLEAVE`: 0 or 1, disable FFMA-interleaving optimization
 - `DG_PTXAS_VERBOSE`: 0 or 1, show detailed PTXAS compiler output
 - `DG_PRINT_REG_REUSE`: 0 or 1, print FFMA-interleaving details
