@@ -14,22 +14,24 @@ using namespace deep_gemm;
 constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto BLOCK_K = 128;
+constexpr auto BLOCK_N_PADDING = {BLOCK_N_PADDING};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 constexpr auto kIsTMAMulticastOnA = {IS_TMA_MULTICAST_ON_A};
 
 // Make a templated GEMM
-using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::Normal>;
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, 1, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::Normal>;
 
 // Launch kernel
-auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
-auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs);
-auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
-auto tma_d_desc = GemmType::make_2d_tma_d_desc(out, m);
-GemmType::run(out, rhs_scales, nullptr,
-              m,
-              tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
-              stream, num_sms, smem_size);
+auto tma_a_desc = gemm_t::make_2d_tma_a_desc(lhs, m);
+auto tma_b_desc = gemm_t::make_2d_tma_b_desc(rhs);
+auto tma_scales_a_desc = gemm_t::make_2d_tma_scales_a_desc(lhs_scales, m);
+auto tma_d_desc = gemm_t::make_3d_tma_d_desc(out, m);
+gemm_t::run(out, rhs_scales, nullptr,
+            m,
+            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
+            stream, num_sms, smem_size);
 """
 
 
@@ -39,8 +41,16 @@ def is_tma_multicast_legal(shape_dim: int, block_dim: int, num_tma_multicast: in
     return (shape_dim % (block_dim * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
 
 
+def get_block_n_padding_for_smem_d(block_n: int) -> int:
+    elem_size, requirement = 2, (4, 8)
+    bank_stride = (block_n * elem_size) // 4
+    padding = (requirement[0] - bank_stride) % requirement[1]
+    return (((padding + requirement[1]) if padding < 0 else padding) * 4) // elem_size
+
+
 def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
-    smem_d = block_m * block_n * 2
+    block_n_padding = get_block_n_padding_for_smem_d(block_n)
+    smem_d = block_m * (block_n + block_n_padding) * 2
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
@@ -91,10 +101,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
-    stage_candidates = (8, 7, 6, 5, 4)
+    stage_candidates = (8, 7, 6, 5, 4, 3)
     if 128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4:
         # Unrolling both stages and `num_former_iters` will cause large code size
-        stage_candidates = (4, )
+        stage_candidates = (4, 3)
     for num_stages in stage_candidates:
         best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
         if best_smem_size <= sm90_capacity:
@@ -119,7 +129,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: less L2 cache usage and less GPU frequency drop
     num_waves = get_num_waves(best_block_m, best_block_n)
     num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
-    num_min_sms = ceil_div(max(num_min_sms, num_sms - 8), best_tma_multicast_config[0]) * best_tma_multicast_config[0]
+    num_min_sms = ceil_div(num_min_sms, best_tma_multicast_config[0]) * best_tma_multicast_config[0]
     assert num_min_sms <= num_sms
 
     return num_min_sms, best_block_m, best_block_n, best_num_stages, best_tma_multicast_config, best_smem_size
@@ -177,6 +187,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
+              'BLOCK_N_PADDING': get_block_n_padding_for_smem_d(block_n),
               'NUM_STAGES': num_stages,
               'NUM_TMA_MULTICAST': tma_multicast_config[0],
               'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
