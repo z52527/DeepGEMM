@@ -27,6 +27,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] Optimizations for power efficiency
 - [ ] Remove shape limitations on N and K
 - [ ] BF16 kernels
+- [ ] Split/stream-k optimizations
 
 ## Performance
 
