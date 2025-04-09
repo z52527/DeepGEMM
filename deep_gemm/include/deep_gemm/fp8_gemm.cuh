@@ -308,9 +308,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     	warpgroup_arrive();
                     	#pragma unroll
                     	for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
-                        	auto desc_a = make_smem_desc(smem_a[s] + (math_wg_idx * WGMMA::M + m_offset) * BLOCK_K + k * WGMMA::K, 1);
-                        	auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
-                        	WGMMA::wgmma(desc_a, desc_b, accum, k);
+                            auto desc_a = make_smem_desc(smem_a[s] + (math_wg_idx * WGMMA::M + m_offset) * BLOCK_K + k * WGMMA::K, 1);
+                            auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                            WGMMA::wgmma(desc_a, desc_b, accum, k);
                     	}
                     	warpgroup_commit_batch();
                     	#pragma unroll
@@ -358,7 +358,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                 #pragma unroll
             	for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
-                	SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                    SM90_U32x4_STSM_N<nv_bfloat162>::copy(
                         __float22bfloat162_rn({shifted_accum[i * 8 + 0], shifted_accum[i * 8 + 1]}),
                         __float22bfloat162_rn({shifted_accum[i * 8 + 2], shifted_accum[i * 8 + 3]}),
                         __float22bfloat162_rn({shifted_accum[i * 8 + 4], shifted_accum[i * 8 + 5]}),
