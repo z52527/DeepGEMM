@@ -304,7 +304,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     	// Commit WGMMA instructions
                     	#pragma unroll
                     	for (int i = 0; i < WGMMA::kNumAccum; ++ i)
-                        	warpgroup_fence_operand(accum[i]);
+                            warpgroup_fence_operand(accum[i]);
                     	warpgroup_arrive();
                     	#pragma unroll
                     	for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
@@ -315,29 +315,29 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     	warpgroup_commit_batch();
                     	#pragma unroll
                     	for (int i = 0; i < WGMMA::kNumAccum; ++ i)
-                        	warpgroup_fence_operand(accum[i]);
+                            warpgroup_fence_operand(accum[i]);
                     	warpgroup_wait<0>();
 
                     	// Notify barrier arrival at the last warpgroup wave
                         if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
-                    		empty_barrier_arrive(s);
+                    	    empty_barrier_arrive(s);
 
                     	// Promote with scales
                     	// NOTES: making it as predicates is very important for performance, comparing to two loops
                     	float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
                     	float scale_0_1, scale_1_1;
                     	if constexpr (not kMustUseUniformedScaleB)
-                        	scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                            scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
 
                         auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                     	#pragma unroll
                     	for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                        	// NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                        	bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
-                        	shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                        	shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                        	shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                        	shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                            // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
+                            bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                            shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                            shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                            shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                            shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
                     	}
                     }
                 }
@@ -356,22 +356,22 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
             	auto m_offset = local_idx * WAVE_BLOCK_M;
                 auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
-				#pragma unroll
+                #pragma unroll
             	for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
                 	SM90_U32x4_STSM_N<nv_bfloat162>::copy(
-                    	__float22bfloat162_rn({shifted_accum[i * 8 + 0], shifted_accum[i * 8 + 1]}),
-                    	__float22bfloat162_rn({shifted_accum[i * 8 + 2], shifted_accum[i * 8 + 3]}),
-                    	__float22bfloat162_rn({shifted_accum[i * 8 + 4], shifted_accum[i * 8 + 5]}),
-                    	__float22bfloat162_rn({shifted_accum[i * 8 + 6], shifted_accum[i * 8 + 7]}),
-                    	smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + i * 16 + 8 * (lane_idx / 16)
-                	);
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 0], shifted_accum[i * 8 + 1]}),
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 2], shifted_accum[i * 8 + 3]}),
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 4], shifted_accum[i * 8 + 5]}),
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 6], shifted_accum[i * 8 + 7]}),
+                        smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + i * 16 + 8 * (lane_idx / 16)
+                    );
             	}
             	if constexpr (WGMMA::kNumAccum % 8 != 0) {
-                	SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                    	__float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 0], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
-                    	__float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 2], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
-                    	smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + WGMMA::kNumAccum / 8 * 16
-                	);
+                    SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 0], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                        __float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 2], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                        smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + WGMMA::kNumAccum / 8 * 16
+                    );
             	}
             }
             cute::tma_store_fence();
