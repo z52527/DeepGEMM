@@ -10,6 +10,24 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 - 2025.04.09: DeepGEMM now achieves up to **1520 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), and [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81) for details.
 
+## Roadmap
+
+- [ ] More correctness tests for grouped-contiguous layout
+- [ ] Shared memory swizzling for output instead of padding
+- [ ] Larger block size on N (up to 256)
+- [ ] MoE scheduler with TMA multicast compatibility
+- [ ] Weight gradient kernels for dense models
+- [ ] Weight gradient kernels for MoE models
+- [ ] Utility kernels for MoE models (as a pre-built CUDA library)
+- [ ] CUDA PDL support
+- [ ] More scaling granularity support via templates
+- [ ] Larger TMA multicast size for some shapes
+- [ ] MMA template refactor with CUTLASS
+- [ ] Optimizations for unaligned shapes
+- [ ] Optimizations for power efficiency
+- [ ] Remove shape limitations on N and K
+- [ ] BF16 kernels
+
 ## Performance
 
 We test all shapes potentially used in DeepSeek-V3/R1 inference (including both prefilling and decoding, but without tensor parallelism) on H800 SXM5 with NVCC 12.8. All speedup metrics are calculated in comparison to our internally and carefully optimized implementation based on CUTLASS 3.6.
