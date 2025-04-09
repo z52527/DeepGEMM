@@ -8,7 +8,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
-- 2025.04.09: DeepGEMM now achieves up to **1520 TFLOPS** on H800! See #74, #78, and #81 for details.
+- 2025.04.09: DeepGEMM now achieves up to **1520 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), and [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81) for details.
 
 ## Performance
 
@@ -164,6 +164,8 @@ The [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide
 
 - Utilization of the [`stmatrix`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-store-instruction-stmatrix) PTX instruction
 - [Register count control](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#miscellaneous-instructions-setmaxnreg) tailored for different warpgroups
+- Larger block sizes
+- Less bank conflicts via 3D TMA 🐳
 - Overlapping as much as possible, e.g. overlapping TMA store and non-TMA RHS scaling factor load 🐳
 
 #### A unified and optimized block scheduler
