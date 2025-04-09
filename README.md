@@ -6,6 +6,10 @@ Currently, DeepGEMM exclusively supports NVIDIA Hopper tensor cores. To address 
 
 Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
 
+## News
+
+- 2025.04.09: DeepGEMM now achieves up to **1520 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), and [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81) for details.
+
 ## Performance
 
 We test all shapes potentially used in DeepSeek-V3/R1 inference (including both prefilling and decoding, but without tensor parallelism) on H800 SXM5 with NVCC 12.8. All speedup metrics are calculated in comparison to our internally and carefully optimized implementation based on CUTLASS 3.6.
@@ -28,11 +32,11 @@ DeepGEMM does not behave very well on some shapes, optimization PRs are welcomed
 | 128  | 7168  | 16384 | 645 TFLOPS  |    2604 GB/s     |  1.4x   |
 | 128  | 4096  | 7168  | 533 TFLOPS  |    2221 GB/s     |  2.0x   |
 | 128  | 7168  | 2048  | 510 TFLOPS  |    2277 GB/s     |  1.7x   |
-| 4096 | 2112  | 7168  | 1009 TFLOPS |     503 GB/s     |  1.1x   |
-| 4096 | 24576 | 1536  | 1125 TFLOPS |     893 GB/s     |  1.1x   |
-| 4096 | 32768 |  512  | 751 TFLOPS  |    1569 GB/s     |  1.1x   |
-| 4096 | 7168  | 16384 | 1426 TFLOPS |     361 GB/s     |  1.3x   |
-| 4096 | 4096  | 7168  | 1265 TFLOPS |     485 GB/s     |  1.2x   |
+| 4096 | 2112  | 7168  | 1127 TFLOPS |     562 GB/s     |  1.2x   |
+| 4096 | 24576 | 1536  | 1212 TFLOPS |     962 GB/s     |  1.2x   |
+| 4096 | 32768 |  512  | 775 TFLOPS  |    1620 GB/s     |  1.2x   |
+| 4096 | 7168  | 16384 | 1520 TFLOPS |     384 GB/s     |  1.4x   |
+| 4096 | 4096  | 7168  | 1410 TFLOPS |     541 GB/s     |  1.3x   |
 | 4096 | 7168  | 2048  | 1168 TFLOPS |     794 GB/s     |  1.2x   |
 
 ### Grouped GEMMs for MoE models (contiguous layout)
@@ -160,6 +164,8 @@ The [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide
 
 - Utilization of the [`stmatrix`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-store-instruction-stmatrix) PTX instruction
 - [Register count control](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#miscellaneous-instructions-setmaxnreg) tailored for different warpgroups
+- Larger block sizes
+- Less bank conflicts via 3D TMA 🐳
 - Overlapping as much as possible, e.g. overlapping TMA store and non-TMA RHS scaling factor load 🐳
 
 #### A unified and optimized block scheduler

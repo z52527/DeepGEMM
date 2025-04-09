@@ -21,10 +21,14 @@ enum class Layout {
     ColMajor
 };
 
+__device__ __host__ constexpr int get_num_math_warpgroups(int block_m) {
+    return block_m == 64 ? 1 : 2;
+}
+
 template <uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup>
 __device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
     DG_STATIC_ASSERT(kNumMathThreadsPerGroup == 128, "Only support 128 threads per math group");
-    return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
+    return get_num_math_warpgroups(block_m) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
 
 template <int kNumFormerIters, int kGap, int kEnd>
@@ -257,7 +261,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
+            constexpr int WAVE_BLOCK_M = WGMMA::M * get_num_math_warpgroups(BLOCK_M);
+            DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
+            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
 
             // Empty barrier arrival
             auto empty_barrier_arrive = [&](int s) {
@@ -285,45 +291,54 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     // Wait TMA arrivals
                     full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
-                    // Read A scales
-                    // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
-                    auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
-
-                    // Commit WGMMA instructions
+                    // TODO: remove some useless computation for unaligned Ms
                     #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum; ++ i)
-                        warpgroup_fence_operand(accum[i]);
-                    warpgroup_arrive();
-                    #pragma unroll
-                    for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
-                        auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
-                        auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
-                        WGMMA::wgmma(desc_a, desc_b, accum, k);
-                    }
-                    warpgroup_commit_batch();
-                    #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum; ++ i)
-                        warpgroup_fence_operand(accum[i]);
-                    warpgroup_wait<0>();
+                    for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
+                      	auto m_offset = local_idx * WAVE_BLOCK_M;
 
-                    // Notify barrier arrival
-                    empty_barrier_arrive(s);
+                    	// Read A scales
+                    	// NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                    	auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0 + m_offset);
+                        auto scale_a_1 = ld_shared(smem_scales_a[s] + r_1 + m_offset);
 
-                    // Promote with scales
-                    // NOTES: making it as predicates is very important for performance, comparing to two loops
-                    float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
-                    float scale_0_1, scale_1_1;
-                    if constexpr (not kMustUseUniformedScaleB)
-                        scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                    	// Commit WGMMA instructions
+                    	#pragma unroll
+                    	for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                            warpgroup_fence_operand(accum[i]);
+                    	warpgroup_arrive();
+                    	#pragma unroll
+                    	for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                            auto desc_a = make_smem_desc(smem_a[s] + (math_wg_idx * WGMMA::M + m_offset) * BLOCK_K + k * WGMMA::K, 1);
+                            auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
+                            WGMMA::wgmma(desc_a, desc_b, accum, k);
+                    	}
+                    	warpgroup_commit_batch();
+                    	#pragma unroll
+                    	for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                            warpgroup_fence_operand(accum[i]);
+                    	warpgroup_wait<0>();
 
-                    #pragma unroll
-                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                        // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                        bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
-                        final_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                        final_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                        final_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                        final_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                    	// Notify barrier arrival at the last warpgroup wave
+                        if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
+                    	    empty_barrier_arrive(s);
+
+                    	// Promote with scales
+                    	// NOTES: making it as predicates is very important for performance, comparing to two loops
+                    	float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
+                    	float scale_0_1, scale_1_1;
+                    	if constexpr (not kMustUseUniformedScaleB)
+                            scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+
+                        auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                    	#pragma unroll
+                    	for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                            // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
+                            bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
+                            shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
+                            shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
+                            shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
+                            shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
+                    	}
                     }
                 }
 
@@ -338,21 +353,26 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             // Write back to shared memory using STSM
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
-            for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
-                SM90_U32x4_STSM_N<nv_bfloat162>::copy(
-                    __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 4], final_accum[i * 8 + 5]}),
-                    __float22bfloat162_rn({final_accum[i * 8 + 6], final_accum[i * 8 + 7]}),
-                    smem_d + (warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + i * 16 + 8 * (lane_idx / 16)
-                );
-            }
-            if constexpr (WGMMA::kNumAccum % 8 != 0) {
-                SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                    __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 0], final_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
-                    __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2], final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
-                    smem_d + (warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + WGMMA::kNumAccum / 8 * 16
-                );
+            for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
+            	auto m_offset = local_idx * WAVE_BLOCK_M;
+                auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                #pragma unroll
+            	for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                    SM90_U32x4_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 0], shifted_accum[i * 8 + 1]}),
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 2], shifted_accum[i * 8 + 3]}),
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 4], shifted_accum[i * 8 + 5]}),
+                        __float22bfloat162_rn({shifted_accum[i * 8 + 6], shifted_accum[i * 8 + 7]}),
+                        smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + i * 16 + 8 * (lane_idx / 16)
+                    );
+            	}
+            	if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                    SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                        __float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 0], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
+                        __float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 2], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
+                        smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + WGMMA::kNumAccum / 8 * 16
+                    );
+            	}
             }
             cute::tma_store_fence();
             cutlass::arch::NamedBarrier(kNumMathThreads).sync();
