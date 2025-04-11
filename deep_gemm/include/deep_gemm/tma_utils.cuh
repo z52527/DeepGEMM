@@ -80,27 +80,6 @@ CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2],
     return tensor_map;
 }
 
-template <typename T>
-CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
-                                  uint64_t gmem_strides[2], uint32_t smem_dim[3],
-                                  PFN_cuTensorMapEncodeTiled encode_func = nullptr) {
-    CUtensorMap tensor_map = {};
-    uint32_t elem_strides[3] = {1, 1, 1};
-
-    if (encode_func == nullptr)
-        encode_func = get_cuTensorMapEncodeTiled();
-
-    auto result = encode_func(
-            &tensor_map, get_CUtensorMapDataType<std::remove_cv_t<T>>(), 3,
-            global_address, gmem_dim, gmem_strides, smem_dim, elem_strides,
-            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    DG_HOST_ASSERT(result == CUDA_SUCCESS);
-    return tensor_map;
-}
-
 template <uint32_t kNumTMAMulticast = 1>
 __device__ __forceinline__ void
 tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
