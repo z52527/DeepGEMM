@@ -868,16 +868,6 @@ struct SM90_64x192x32_F32E4M3E4M3_SS {
 };
 
 template <typename dtype_t>
-struct SM90_U32x1_STSM_N {
-    __device__ __forceinline__ static void
-    copy(dtype_t src_0, void* smem_dst) {
-        const uint32_t src[1] = {*reinterpret_cast<uint32_t*>(&src_0)};
-        asm volatile("stmatrix.sync.aligned.x1.m8n8.shared.b16 [%0], {%1};\n"
-                     :: "l"(smem_dst), "r"(src[0]));
-    }
-};
-
-template <typename dtype_t>
 struct SM90_U32x2_STSM_N {
     __device__ __forceinline__ static void
     copy(dtype_t src_0, dtype_t src_1, void* smem_dst) {
