@@ -54,8 +54,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 uint32_t shape_m,
                 const __grid_constant__ CUtensorMap tensor_map_a,
                 const __grid_constant__ CUtensorMap tensor_map_b,
-                const __grid_constant__ CUtensorMap tensor_map_scales_a,
-                const __grid_constant__ std::pair<CUtensorMap, CUtensorMap> tensor_map_d) {
+                const __grid_constant__ CUtensorMap tensor_map_scales_a) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -87,10 +86,6 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_a));
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_b));
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_scales_a));
-        if constexpr (SHAPE_N >= BLOCK_N)
-            cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d.first));
-        if constexpr (SHAPE_N % BLOCK_N != 0)
-            cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d.second));
     }
     __syncwarp();
 
@@ -350,14 +345,14 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 }
             }, num_former_iters);
 
-            // Write back to shared memory using STSM
+            // Write back to shared memory using STSM and issue TMA stores
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
             for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
-            	auto m_offset = local_idx * WAVE_BLOCK_M;
+                auto m_offset = local_idx * WAVE_BLOCK_M;
                 auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                 #pragma unroll
-            	for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
                     SM90_U32x4_STSM_N<nv_bfloat162>::copy(
                         __float22bfloat162_rn({shifted_accum[i * 8 + 0], shifted_accum[i * 8 + 1]}),
                         __float22bfloat162_rn({shifted_accum[i * 8 + 2], shifted_accum[i * 8 + 3]}),
@@ -365,33 +360,30 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         __float22bfloat162_rn({shifted_accum[i * 8 + 6], shifted_accum[i * 8 + 7]}),
                         smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + i * 16 + 8 * (lane_idx / 16)
                     );
-            	}
-            	if constexpr (WGMMA::kNumAccum % 8 != 0) {
+                }
+                if constexpr (WGMMA::kNumAccum % 8 != 0) {
                     SM90_U32x2_STSM_N<nv_bfloat162>::copy(
                         __float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 0], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 1]}),
                         __float22bfloat162_rn({shifted_accum[WGMMA::kNumAccum / 8 * 8 + 2], shifted_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
                         smem_d + (m_offset + warp_idx * 16 + lane_idx % 16) * (BLOCK_N + BLOCK_N_PADDING) + WGMMA::kNumAccum / 8 * 16
                     );
-            	}
-            }
-            cute::tma_store_fence();
-            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-
-            // Use TMA store to write back to global memory
-            if (threadIdx.x == 0) {
-                if (n_block_idx < SHAPE_N / BLOCK_N) {
-                    // Except the last unaligned block
-                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d.first, smem_d, 0, n_block_idx,
-                                                  scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
-                } else {
-                    // The last unaligned block
-                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d.second, smem_d, 0, 0,
-                                                  scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
                 }
-                cute::tma_store_arrive();
-                cute::tma_store_wait<0>();
+
+                // Issue TMA store
+                cute::tma_store_fence();
+                if (lane_idx < 16) {
+                    uint64_t gmem_m_offset = scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx);
+                    auto smem_ptr = smem_d + (m_offset + warp_idx * 16 + lane_idx) * (BLOCK_N + BLOCK_N_PADDING);
+                    auto gmem_ptr = gmem_d + (gmem_m_offset + m_offset + warp_idx * 16 + lane_idx) * SHAPE_N + n_block_idx * BLOCK_N;
+                    auto num_valid_cols = (n_block_idx == ceil_div(SHAPE_N, BLOCK_N) - 1) ? (SHAPE_N - n_block_idx * BLOCK_N) : BLOCK_N;
+                    cute::SM90_BULK_COPY_S2G::copy(smem_ptr, gmem_ptr, num_valid_cols * sizeof(nv_bfloat16));
+                }
+                __syncwarp();
             }
-            __syncwarp();
+
+            // Wait TMA to be finished
+            cute::tma_store_arrive();
+            cute::tma_store_wait<0>();
         }
     }
 #else
@@ -418,7 +410,6 @@ public:
                     const CUtensorMap& tma_a_desc,
                     const CUtensorMap& tma_b_desc,
                     const CUtensorMap& tma_scales_a_desc,
-                    const std::pair<CUtensorMap, CUtensorMap>& tma_d_desc,
                     cudaStream_t stream,
                     int num_sms, uint32_t smem_size) {
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
@@ -451,7 +442,7 @@ public:
         auto status = cudaLaunchKernelEx(&config, kernel,
                                          gmem_d, scales_b, grouped_layout,
                                          shape_m,
-                                         tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
+                                         tma_a_desc, tma_b_desc, tma_scales_a_desc);
         DG_HOST_ASSERT(status == cudaSuccess);
     }
 
@@ -465,29 +456,6 @@ public:
     static CUtensorMap make_2d_tma_b_desc(T* global_address) {
         return make_2d_tma_desc(global_address, Layout::ColMajor,
                                 SHAPE_K, SHAPE_N * (kGemmType != GemmType::Normal ? kNumGroups : 1), BLOCK_K, BLOCK_N);
-    }
-
-    template <typename T>
-    static std::pair<CUtensorMap, CUtensorMap> make_3d_tma_d_desc(T* global_address, uint32_t shape_m) {
-        // NOTES: must be row-major
-        auto m = shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1);
-        uint64_t gmem_strides[2] = {BLOCK_N * sizeof(T), SHAPE_N * sizeof(T)};
-        uint32_t smem_dim[3] = {BLOCK_N + BLOCK_N_PADDING, 1, BLOCK_M};
-
-        // `SHAPE_N % BLOCK_N` maybe not zero, dividing them into two parts
-        CUtensorMap aligned;
-        if constexpr (SHAPE_N >= BLOCK_N) {
-            uint64_t gmem_dim[3] = {BLOCK_N, SHAPE_N / BLOCK_N, m};
-            aligned = make_3d_tma_copy_desc(global_address, gmem_dim, gmem_strides, smem_dim);
-        }
-
-        CUtensorMap unaligned;
-        if constexpr (SHAPE_N % BLOCK_N != 0) {
-            uint64_t gmem_dim[3] = {SHAPE_N % BLOCK_N, 1, m};
-            unaligned = make_3d_tma_copy_desc(global_address + (SHAPE_N / BLOCK_N) * BLOCK_N,
-                                              gmem_dim, gmem_strides, smem_dim);
-        }
-        return {aligned, unaligned};
     }
 
     template <typename T>
