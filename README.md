@@ -18,8 +18,6 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [x] MoE scheduler with TMA multicast compatibility
 - [x] Fix TMA multicast compatibility for indivisible shapes
 - [ ] Skip useless computation on M
-- [ ] Share pipeline stages between scheduled blocks
-- [ ] TMA store pipeline
 - [ ] NVRTC as a faster compiler
 - [ ] Sanitizer for testing
 - [ ] Weight gradient kernels for dense models
