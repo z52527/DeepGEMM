@@ -74,8 +74,7 @@ class JITTuner:
 
         # Cache the best runtime and return
         if int(os.getenv('DG_JIT_DEBUG', 0)) or int(os.getenv('DG_PRINT_AUTOTUNE', 0)):
-            print(
-                f'Best JIT kernel {name} with keys {keys} has tuned keys {best_keys} and time {best_time}')
+            print(f'Best JIT kernel {name} with keys {keys} has tuned keys {best_keys} and time {best_time}')
         self.tuned[signature] = (best_runtime, best_keys)
         return best_runtime, best_keys
 

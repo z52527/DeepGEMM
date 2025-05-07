@@ -120,6 +120,8 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print NVCC compilation command, `0` by default
 - Post optimization
   - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default
+- Heuristic selection
+  - `DG_PRINT_AUTOTUNE`: `0` or `1`, print selected configs for each shape, `0` by default
 - Testing
   - `DG_NSYS_PROFILING`: `0` or `1`, Nsight-system compatible testing, `0` by default
 
