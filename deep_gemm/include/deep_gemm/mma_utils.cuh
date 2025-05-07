@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef __CUDACC_RTC__
 #include <cuda.h>
+#endif
 
 #include <cute/arch/mma_sm90_gmma.hpp>
 #include <cute/arch/mma_sm90_gmma_ext.hpp>
