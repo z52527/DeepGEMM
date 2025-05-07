@@ -50,7 +50,6 @@ def get_nvcc_compiler() -> Tuple[str, str]:
     paths = []
     if os.getenv('DG_JIT_NVCC_COMPILER'):
         paths.append(os.getenv('DG_JIT_NVCC_COMPILER'))
-    
     paths.append(os.path.join(CUDA_HOME, 'bin', 'nvcc'))
 
     # Try to find the first available NVCC compiler
@@ -181,7 +180,7 @@ class NVCCCompiler(Compiler):
 
     @classmethod
     def signature(cls) -> str:
-        return f'nvcc+{cls.__version__()}'
+        return f'{get_nvcc_compiler()[0]}+{cls.__version__()}'
 
     @classmethod
     def flags(cls) -> List[str]:

@@ -39,7 +39,9 @@ __global__ void vector_add(T* a, T* b, T* c, uint32_t n) {{
     }}
 }}
 
-auto ptr = reinterpret_cast<void*>(&vector_add<float>);
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&vector_add<{kwargs['T']}>);
+}}
 """
 
     # noinspection PyShadowingNames,PyMethodOverriding
