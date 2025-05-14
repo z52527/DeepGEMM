@@ -247,7 +247,6 @@ static void __instantiate_kernel() {{
         config.hStream = stream
 
         arg_values = (
-            gmem_d.data_ptr(),
             scales_b.data_ptr(),
             grouped_layout.data_ptr(),
             shape_m,
@@ -257,7 +256,6 @@ static void __instantiate_kernel() {{
             tensor_map_d,
         )
         arg_types = (
-            ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_uint32,
