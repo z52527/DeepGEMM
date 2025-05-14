@@ -34,17 +34,22 @@ def get_block_n_padding_for_smem_d(block_n: int) -> int:
     return (((padding + requirement[1]) if padding < 0 else padding) * 4) // elem_size
 
 
-def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> Tuple[int, int, int]:
+def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128,        
+                    is_fp32_out: bool = False, is_wgrad: bool = False) -> Tuple[int, int, int]:
+    assert block_k == 128
+
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = get_swizzle_mode(block_n)
     block_n_padding = get_block_n_padding_for_smem_d(
         block_n) if swizzle_mode == 0 else 0
 
-    smem_d = block_m * (block_n + block_n_padding) * 2
+    # NOTES: `scales_b` in a total manner or per-stage manner
+    smem_d = block_m * (block_n + block_n_padding) * (4 if is_fp32_out else 2)
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
-    smem_scales_b = ceil_div(k, block_k) * 4
+    smem_scales_b_per_stage = ceil_div(block_n * 4, block_k) * block_k if is_wgrad else 0
+    smem_scales_b = ceil_div(k, block_k) * 4 if not is_wgrad else 0
     smem_barrier = num_stages * 8 * 2
 
     smem_size = 0
@@ -52,8 +57,8 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
-    smem_size += ceil_div(smem_scales_b * (1 if block_k %
-                          block_n == 0 else 2), 8) * 8
+    smem_size += num_stages * smem_scales_b_per_stage
+    smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
     smem_size += smem_barrier
 
     # Swizzle and padding are not compatible
@@ -64,13 +69,18 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
+                     is_fp32_out: bool = False, is_wgrad: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     if not is_grouped_contiguous:
-        block_ms = (64, 128, 256)
+        block_ms = (64, 128, ) + ((256, ) if not is_fp32_out else ())
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
-    block_ns = tuple(range(16, 129, 8)) + (144, 160, )
+    block_ns = tuple(range(16, 129, 8)) + ((136, 152, ) if is_wgrad else (144, 160, ))
+    
+    # Avoid bank conflicts for FP32 output
+    if is_fp32_out:
+        block_ns = [x for x in block_ns if x % 16 == 8]
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -110,7 +120,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = tuple(filter(lambda s: s <= max(k // 128, 1), (4, 3, 2, 1)))
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, is_fp32_out=is_fp32_out, is_wgrad=is_wgrad)
         if best_smem_config[0] <= sm90_capacity:
             best_num_stages = num_stages
             break
@@ -145,11 +155,14 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
                          out: torch.Tensor) -> None:
     """
-    Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
-    LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
-    RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
-        this function will do a transposing with a set of slow PyTorch operations.
+    Perform a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
+
+    Requirements:
+        LHS, RHS, and output tensors must be contiguous in dimension 1, i.e., stride(1) = 1.
+        The stride(0) of LHS and RHS must be a multiple of 16, and the stride(0) of output must be a multiple of 8.
+        RHS and RHS scaling factors are required to be transposed.
+        The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
+            this function will do a transposing with a set of slow PyTorch operations.
 
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[m, k]`,
@@ -164,8 +177,6 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     n, k_ = rhs.shape
     m_, n_ = out.shape
 
-    assert n % 64 == 0 and k % 128 == 0
-
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
@@ -174,7 +185,14 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
-    assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
+    assert lhs.stride(1) == 1 and out.stride(1) == 1 and rhs.stride(1) == 1
+
+    lhs_stride = lhs.stride(0)
+    rhs_stride = rhs.stride(0)
+    out_stride = out.stride(0)
+
+    # The stride(0) of LHS, RHS, and output must be aligned to 16 bytes
+    assert lhs_stride % 16 == 0 and rhs_stride % 16 == 0 and out_stride % 8 == 0
 
     # LHS scales must be transposed for TMA loads, but not for RHS scales
     # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
@@ -185,6 +203,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     if m == 0:
         return
 
+    # K must be aligned to 128
+    aligned_k = (k + 127) // 128 * 128
+
     # Auto-tuning with compilation
     num_sms = get_num_sms()
     num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
@@ -194,11 +215,11 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     num_math_threads_per_group = 128
 
     tensor_map_a = make_2d_tma_a_desc(
-        GemmType.Normal, lhs, m, k, block_m, block_k, 1)
+        GemmType.Normal, lhs, m, k, block_m, block_k, 1, a_stride=lhs_stride)
     tensor_map_b = make_2d_tma_b_desc(
-        GemmType.Normal, rhs, k, n, block_k, block_n, 1)
+        GemmType.Normal, rhs, k, n, block_k, block_n, 1, b_stride=rhs_stride)
     tensor_map_d = make_2d_tma_d_desc(
-        GemmType.Normal, out, m, n, block_m, block_n, 1, smem_config[1])
+        GemmType.Normal, out, m, n, block_m, block_n, 1, smem_config[1], d_stride=out_stride)
     tensor_map_scales_a = make_2d_tma_scales_a_desc(
         GemmType.Normal, lhs_scales, m, k, block_m, block_k)
 
@@ -223,7 +244,8 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     
     runtime, best_keys = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
-        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
+        keys={'N': n, 'K': aligned_k,
+              'BLOCK_M': block_m, 'BLOCK_N': block_n,
               'SWIZZLE_D_MODE': smem_config[1],
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_STAGES': num_stages,
