@@ -25,14 +25,14 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] Sanitizer for testing
 - [x] Weight gradient kernels for dense models
 - [x] Weight gradient kernels for MoE models
+- [ ] Better `get_best_configs` modeling
 - [ ] Utility kernels for MoE models (maybe with [tile-lang](https://github.com/tile-ai/tilelang))
 - [ ] CUDA PDL support
 - [ ] More scaling granularity support via templates
 - [ ] Larger TMA multicast size for some shapes
 - [x] MMA template refactor with CUTLASS
-- [ ] Optimizations for unaligned shapes
 - [ ] Optimizations for power efficiency
-- [ ] Remove shape limitations on N and K
+- [x] Remove shape limitations on N and K
 - [ ] BF16 kernels
 - [ ] Split/stream-k optimizations
 
