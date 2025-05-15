@@ -1,4 +1,3 @@
-import copy
 import os
 import subprocess
 import time
@@ -27,14 +26,14 @@ class Runtime:
         return all(os.path.exists(os.path.join(path, file)) for file in files)
 
     @staticmethod
-    def generate(**kwargs) -> str:
+    def generate(kwargs: Dict[str, Any]) -> str:
         raise NotImplemented
 
     @staticmethod
-    def launch(kernel: cbd.CUkernel, **kwargs) -> cbd.CUresult:
+    def launch(kernel: cbd.CUkernel, kwargs: Dict[str, Any]) -> cbd.CUresult:
         raise NotImplemented
 
-    def __call__(self, **kwargs) -> cbd.CUresult:
+    def __call__(self, kwargs: Dict[str, Any]) -> cbd.CUresult:
         # Load CUBIN
         if self.kernel is None:
             start_time = time.time_ns()

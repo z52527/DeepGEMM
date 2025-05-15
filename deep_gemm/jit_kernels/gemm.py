@@ -237,6 +237,6 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     }
 
     # Generate, build and run the kernel
-    code = FP8GemmRuntime.generate(**kwargs)
+    code = FP8GemmRuntime.generate(kwargs)
     runtime = build('gemm_fp8_fp8_bf16_nt', code, FP8GemmRuntime, kwargs)
-    runtime(**kwargs)
+    runtime(kwargs)

@@ -16,7 +16,7 @@ class VectorAddRuntime(jit.Runtime):
         super().__init__(path)
 
     @staticmethod
-    def generate(**kwargs) -> str:
+    def generate(kwargs: Dict[str, Any]) -> str:
         return f"""
 #ifdef __CUDACC_RTC__
 #include <deep_gemm/nvrtc_std.cuh>

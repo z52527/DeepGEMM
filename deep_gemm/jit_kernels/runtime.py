@@ -138,7 +138,7 @@ class FP8GemmRuntime(Runtime):
         super().__init__(path)
 
     @staticmethod
-    def generate(**kwargs) -> str:
+    def generate(kwargs: Dict[str, Any]) -> str:
         code = f'''
 #ifdef __CUDACC_RTC__
 #include <deep_gemm/nvrtc_std.cuh>
@@ -233,7 +233,7 @@ class FP8WGradGemmRuntime(Runtime):
         super().__init__(path)
 
     @staticmethod
-    def generate(**kwargs) -> str:
+    def generate(kwargs: Dict[str, Any]) -> str:
         code = f'''
 #ifdef __CUDACC_RTC__
 #include <deep_gemm/nvrtc_std.cuh>
