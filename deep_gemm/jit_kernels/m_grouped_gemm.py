@@ -1,12 +1,12 @@
 import torch
 from typing import Tuple
 
+from ..jit import build
 from .gemm import get_best_configs
 from .runtime import (
     FP8GemmRuntime, GemmType,
     make_2d_tma_a_desc, make_2d_tma_b_desc,
-    make_2d_tma_d_desc, make_2d_tma_scales_a_desc)
-from .tuner import jit_tuner
+    make_2d_tma_d_desc, make_2d_tma_scales_desc)
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 
 
@@ -69,21 +69,25 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     num_tma_threads = 128
     num_math_threads_per_group = 128
 
-    tensor_map_a = make_2d_tma_a_desc(
-        GemmType.GroupedContiguous, lhs, m, k, block_m, block_k, num_groups)
-    tensor_map_b = make_2d_tma_b_desc(
-        GemmType.GroupedContiguous, rhs, k, n, block_k, block_n, num_groups)
-    tensor_map_d = make_2d_tma_d_desc(
-        GemmType.GroupedContiguous, out, m, n, block_m, block_n, num_groups, smem_config[1])
-    tensor_map_scales_a = make_2d_tma_scales_a_desc(
-        GemmType.GroupedContiguous, lhs_scales, m, k, block_m, block_k, num_groups)
+    tensor_map_a = make_2d_tma_a_desc(GemmType.GroupedContiguous, lhs, m, k, k, block_m, block_k, num_groups)
+    tensor_map_b = make_2d_tma_b_desc(GemmType.GroupedContiguous, rhs, n, k, k, block_n, block_k, num_groups)
+    tensor_map_d = make_2d_tma_d_desc(GemmType.GroupedContiguous, out, m, n, n, block_m, block_n, num_groups, smem_config[1])
+    tensor_map_scales_a = make_2d_tma_scales_desc(GemmType.GroupedContiguous, lhs_scales, m, k, block_m, block_k, num_groups)
 
     kwargs = {
+        # Templated arguments
         'NUM_TMA_THREADS': num_tma_threads,
         'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
-        'M': m,
-        'BLOCK_K': block_k,
-        'GMEM_D': out,
+        'M': m, 'N': n, 'K': k,
+        'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+        'SWIZZLE_D_MODE': smem_config[1],
+        'BLOCK_N_PADDING': smem_config[2],
+        'NUM_GROUPS': num_groups,
+        'NUM_STAGES': num_stages,
+        'NUM_TMA_MULTICAST': tma_multicast_config[0],
+        'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1],
+        'GEMM_TYPE': GemmType.GroupedContiguous,
+        # Runtime arguments
         'SCALES_B': rhs_scales,
         'GROUPED_LAYOUT': m_indices,
         'NUM_SMS': num_sms,
@@ -93,25 +97,13 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
         'TENSOR_MAP_SCALES_A': tensor_map_scales_a,
         'TENSOR_MAP_D': tensor_map_d,
         'STREAM': torch.cuda.current_stream().cuda_stream,
+        'DEVICE_INDEX': out.device.index
     }
 
-    runtime, best_keys = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_fp8_fp8_bf16_nt',
-        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'SWIZZLE_D_MODE': smem_config[1],
-              'BLOCK_N_PADDING': smem_config[2],
-              'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages,
-              'NUM_TMA_MULTICAST': tma_multicast_config[0],
-              'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1],
-              'GEMM_TYPE': GemmType.GroupedContiguous},
-        space=(),
-        kwargs=kwargs,
-        runtime_cls=FP8GemmRuntime,
-    )
-
-    # Run the kernel
-    runtime(**best_keys, **kwargs)
+    # Generate, build and run the kernel
+    code = FP8GemmRuntime.generate(**kwargs)
+    runtime = build('m_grouped_gemm_fp8_fp8_bf16_nt', code, FP8GemmRuntime)
+    runtime(**kwargs)
 
 
 def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -176,21 +168,25 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     num_tma_threads = 128
     num_math_threads_per_group = 128
 
-    tensor_map_a = make_2d_tma_a_desc(
-        GemmType.GroupedMasked, lhs, m, k, block_m, block_k, num_groups)
-    tensor_map_b = make_2d_tma_b_desc(
-        GemmType.GroupedMasked, rhs, k, n, block_k, block_n, num_groups)
-    tensor_map_d = make_2d_tma_d_desc(
-        GemmType.GroupedMasked, out, m, n, block_m, block_n, num_groups, smem_config[1])
-    tensor_map_scales_a = make_2d_tma_scales_a_desc(
-        GemmType.GroupedMasked, lhs_scales, m, k, block_m, block_k, num_groups)
+    tensor_map_a = make_2d_tma_a_desc(GemmType.GroupedMasked, lhs, m, k, k, block_m, block_k, num_groups)
+    tensor_map_b = make_2d_tma_b_desc(GemmType.GroupedMasked, rhs, n, k, k, block_n, block_k, num_groups)
+    tensor_map_d = make_2d_tma_d_desc(GemmType.GroupedMasked, out, m, n, n, block_m, block_n, num_groups, smem_config[1])
+    tensor_map_scales_a = make_2d_tma_scales_desc(GemmType.GroupedMasked, lhs_scales, m, k, block_m, block_k, num_groups)
 
     kwargs = {
+        # Templated arguments
         'NUM_TMA_THREADS': num_tma_threads,
         'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
-        'M': m,
-        'BLOCK_K': block_k,
-        'GMEM_D': out,
+        'M': m, 'N': n, 'K': k,
+        'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+        'SWIZZLE_D_MODE': smem_config[1],
+        'BLOCK_N_PADDING': smem_config[2],
+        'NUM_GROUPS': num_groups,
+        'NUM_STAGES': num_stages,
+        'NUM_TMA_MULTICAST': tma_multicast_config[0],
+        'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1],
+        'GEMM_TYPE': GemmType.GroupedMasked,
+        # Runtime arguments
         'SCALES_B': rhs_scales,
         'GROUPED_LAYOUT': masked_m,
         'NUM_SMS': num_sms,
@@ -200,22 +196,10 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
         'TENSOR_MAP_SCALES_A': tensor_map_scales_a,
         'TENSOR_MAP_D': tensor_map_d,
         'STREAM': torch.cuda.current_stream().cuda_stream,
+        'DEVICE_INDEX': out.device.index
     }
 
-    runtime, best_keys = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_fp8_fp8_bf16_nt',
-        keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'SWIZZLE_D_MODE': smem_config[1],
-              'BLOCK_N_PADDING': smem_config[2],
-              'NUM_GROUPS': num_groups,
-              'NUM_STAGES': num_stages,
-              'NUM_TMA_MULTICAST': tma_multicast_config[0],
-              'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1],
-              'GEMM_TYPE': GemmType.GroupedMasked},
-        space=(),
-        kwargs=kwargs,
-        runtime_cls=FP8GemmRuntime,
-    )
-
-    # Run the kernel
-    runtime(**best_keys, **kwargs)
+    # Generate, build and run the kernel
+    code = FP8GemmRuntime.generate(**kwargs)
+    runtime = build('m_grouped_gemm_fp8_fp8_bf16_nt', code, FP8GemmRuntime)
+    runtime(**kwargs)
