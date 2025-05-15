@@ -123,7 +123,7 @@ The library also provides some environment variables, which may be useful:
 - Post optimization
   - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default
 - Heuristic selection
-  - `DG_PRINT_HEURISTIC`: `0` or `1`, print selected configs for each shape, `0` by default
+  - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
 - Testing
   - `DG_NSYS_PROFILING`: `0` or `1`, Nsight-system compatible testing, `0` by default
 
