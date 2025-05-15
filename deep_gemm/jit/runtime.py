@@ -48,7 +48,7 @@ class Runtime:
             command = [f'{CUDA_HOME}/bin/cuobjdump', '-symbols', path]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert result.returncode == 0
-            illegal_names = ['vprintf', '__instantiate_kernel', '__internal']
+            illegal_names = ['vprintf', '__instantiate_kernel', '__internal', '__assertfail']
             check_illegal = lambda line: any([name in line for name in illegal_names])
             kernel_names = [line.split()[-1] for line in result.stdout.splitlines()
                             if line.startswith('STT_FUNC') and not check_illegal(line)]
