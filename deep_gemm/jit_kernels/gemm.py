@@ -3,11 +3,11 @@ import torch
 from functools import lru_cache
 from typing import Tuple
 
+from ..jit import build
 from .runtime import (
     FP8GemmRuntime, GemmType,
     make_2d_tma_a_desc, make_2d_tma_b_desc,
-    make_2d_tma_d_desc, make_2d_tma_scales_a_desc)
-from .tuner import jit_tuner
+    make_2d_tma_d_desc, make_2d_tma_scales_desc)
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
 
 
@@ -18,7 +18,6 @@ def is_tma_multicast_legal(shape_dim: int, block_dim: int, num_tma_multicast: in
 
 
 def get_swizzle_mode(block_n: int) -> int:
-    # TODO: remove some candidates if slow
     elem_size = 2
     for mode_bytes in (128, 64, 32):
         if (block_n * elem_size) % mode_bytes == 0:
@@ -180,22 +179,15 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
-    assert lhs_scales.shape == (m, (k + 127) // 128)
-    assert rhs_scales.shape == ((n + 127) // 128, (k + 127) // 128)
+    assert lhs_scales.shape == (m, ceil_div(k, 128))
+    assert rhs_scales.shape == (ceil_div(n, 128), ceil_div(k, 128))
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert lhs.stride(1) == 1 and out.stride(1) == 1 and rhs.stride(1) == 1
 
-    lhs_stride = lhs.stride(0)
-    rhs_stride = rhs.stride(0)
-    out_stride = out.stride(0)
-
-    # The stride(0) of LHS, RHS, and output must be aligned to 16 bytes
-    assert lhs_stride % 16 == 0 and rhs_stride % 16 == 0 and out_stride % 8 == 0
-
     # LHS scales must be transposed for TMA loads, but not for RHS scales
-    # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
+    # NOTES: `get_col_major_tma_aligned_tensor` may launch a kernel if not processed by previous kernels
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert rhs_scales.is_contiguous()
 
@@ -204,33 +196,34 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         return
 
     # K must be aligned to 128
-    aligned_k = (k + 127) // 128 * 128
+    aligned_k = ceil_div(k, 128) * 128
 
     # Auto-tuning with compilation
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
-        m, n, k, 1, num_sms)
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(m, n, k, 1, num_sms)
     block_k = 128
     num_tma_threads = 128
     num_math_threads_per_group = 128
 
-    tensor_map_a = make_2d_tma_a_desc(
-        GemmType.Normal, lhs, m, k, block_m, block_k, 1, a_stride=lhs_stride)
-    tensor_map_b = make_2d_tma_b_desc(
-        GemmType.Normal, rhs, k, n, block_k, block_n, 1, b_stride=rhs_stride)
-    tensor_map_d = make_2d_tma_d_desc(
-        GemmType.Normal, out, m, n, block_m, block_n, 1, smem_config[1], d_stride=out_stride)
-    tensor_map_scales_a = make_2d_tma_scales_a_desc(
-        GemmType.Normal, lhs_scales, m, k, block_m, block_k)
+    tensor_map_a = make_2d_tma_a_desc(GemmType.Normal, lhs, m, k, lhs.stride(0), block_m, block_k, 1)
+    tensor_map_b = make_2d_tma_b_desc(GemmType.Normal, rhs, n, k, rhs.stride(0), block_n, block_k, 1)
+    tensor_map_d = make_2d_tma_d_desc(GemmType.Normal, out, m, n, out.stride(0), block_m, block_n, 1, smem_config[1])
+    tensor_map_scales_a = make_2d_tma_scales_desc(GemmType.Normal, lhs_scales, m, k, block_m, block_k, 1)
 
     kwargs = {
+        # Templated arguments
         'GEMM_TYPE': GemmType.Normal,
         'NUM_TMA_THREADS': num_tma_threads,
         'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
-        'M': m,
+        'M': m, 'N': n, 'K': aligned_k,
         'NUM_GROUPS': 1,
-        'BLOCK_K': block_k,
-        'GMEM_D': out,
+        'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
+        'SWIZZLE_D_MODE': smem_config[1],
+        'BLOCK_N_PADDING': smem_config[2],
+        'NUM_STAGES': num_stages,
+        'NUM_TMA_MULTICAST': tma_multicast_config[0],
+        'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1],
+        # Runtime arguments
         'SCALES_B': rhs_scales,
         'GROUPED_LAYOUT': torch.empty(0, dtype=torch.int32, device=out.device),
         'NUM_SMS': num_sms,
@@ -240,21 +233,10 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         'TENSOR_MAP_SCALES_A': tensor_map_scales_a,
         'TENSOR_MAP_D': tensor_map_d,
         'STREAM': torch.cuda.current_stream().cuda_stream,
+        'DEVICE_INDEX': out.device.index
     }
-    
-    runtime, best_keys = jit_tuner.compile_and_tune(
-        name='gemm_fp8_fp8_bf16_nt',
-        keys={'N': n, 'K': aligned_k,
-              'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'SWIZZLE_D_MODE': smem_config[1],
-              'BLOCK_N_PADDING': smem_config[2],
-              'NUM_STAGES': num_stages,
-              'NUM_TMA_MULTICAST': tma_multicast_config[0],
-              'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
-        space=(),
-        kwargs=kwargs,
-        runtime_cls=FP8GemmRuntime,
-    )
 
-    # Run the kernel
-    runtime(**best_keys, **kwargs)
+    # Generate, build and run the kernel
+    code = FP8GemmRuntime.generate(kwargs)
+    runtime = build('gemm_fp8_fp8_bf16_nt', code, FP8GemmRuntime, kwargs)
+    runtime(kwargs)

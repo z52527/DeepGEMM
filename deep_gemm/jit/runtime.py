@@ -1,18 +1,18 @@
 import os
 import subprocess
 import time
+import torch
 import cuda.bindings.driver as cbd
 
-from typing import List, Optional, Type
+from typing import Any, Dict, Optional, Type
 from torch.utils.cpp_extension import CUDA_HOME
 
 
 class Runtime:
-    def __init__(self, path: str, args: List[str] = None) -> None:
+    def __init__(self, path: str) -> None:
         self.path = path
         self.lib = None
         self.kernel = None
-        self.args = args
         assert self.is_path_valid(self.path)
 
     @staticmethod
@@ -26,14 +26,14 @@ class Runtime:
         return all(os.path.exists(os.path.join(path, file)) for file in files)
 
     @staticmethod
-    def generate(**kwargs) -> str:
+    def generate(kwargs: Dict[str, Any]) -> str:
         raise NotImplemented
 
     @staticmethod
-    def launch(kernel: cbd.CUkernel, **kwargs) -> cbd.CUresult:
+    def launch(kernel: cbd.CUkernel, kwargs: Dict[str, Any]) -> cbd.CUresult:
         raise NotImplemented
 
-    def __call__(self, **kwargs) -> cbd.CUresult:
+    def __call__(self, kwargs: Dict[str, Any]) -> cbd.CUresult:
         # Load CUBIN
         if self.kernel is None:
             start_time = time.time_ns()
@@ -48,8 +48,10 @@ class Runtime:
             command = [f'{CUDA_HOME}/bin/cuobjdump', '-symbols', path]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert result.returncode == 0
+            illegal_names = ['vprintf', '__instantiate_kernel', '__internal', '__assertfail']
+            check_illegal = lambda line: any([name in line for name in illegal_names])
             kernel_names = [line.split()[-1] for line in result.stdout.splitlines()
-                            if line.startswith('STT_FUNC') and '__instantiate_kernel' not in line]
+                            if line.startswith('STT_FUNC') and not check_illegal(line)]
             assert len(kernel_names) == 1, f'Too many kernels in the library: {kernel_names}'
 
             # Load kernel from the library
@@ -62,7 +64,7 @@ class Runtime:
                 print(f'Loading JIT runtime {self.path} took {elapsed_time:.2f} ms.')
 
         # noinspection PyArgumentList
-        return self.launch(self.kernel, *[kwargs[arg] for arg in self.args])
+        return self.launch(self.kernel, kwargs)
 
     def __del__(self) -> None:
         if self.lib is not None:
@@ -78,13 +80,23 @@ class RuntimeCache:
     def __setitem__(self, path: str, runtime: Runtime) -> None:
         self.cache[path] = runtime
 
-    def get(self, path: str, runtime_cls: Type[Runtime]) -> Optional[Runtime]:
+    def get(self, path: str, runtime_cls: Type[Runtime],
+            name: str = '', kwargs: Dict[str, Any] = None) -> Optional[Runtime]:
         # In Python runtime
         if path in self.cache:
             return self.cache[path]
 
         # Already compiled
         if not int(os.getenv('DG_JIT_DISABLE_CACHE', 0)) and os.path.exists(path) and Runtime.is_path_valid(path):
+            # Print heuristic for the first time
+            if name and (int(os.getenv('DG_JIT_DEBUG', 0)) or int(os.getenv('DG_PRINT_CONFIGS', 0))):
+                simplified_kwargs = dict()
+                for key, value in kwargs.items():
+                    value = f'torch.Tensor<{value.dtype}>' if isinstance(value, torch.Tensor) else value
+                    value = f'cuda.bindings.driver.CUtensorMap' if isinstance(value, cbd.CUtensorMap) else value
+                    simplified_kwargs[key] = value
+                print(f'Put kernel {name} with {simplified_kwargs} into runtime cache')
+
             runtime = runtime_cls(path)
             self.cache[path] = runtime
             return runtime
