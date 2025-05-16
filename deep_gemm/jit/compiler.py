@@ -166,7 +166,7 @@ class Compiler:
         os.replace(tmp_cubin_path, cubin_path)
 
         # Put cache and return
-        runtime = runtime_cache.get(path, runtime_cls, name, kwargs)
+        runtime = runtime_cache.get(path, runtime_cls, name, kwargs, force_enable_cache=True)
         assert runtime is not None
         return runtime
 

@@ -110,7 +110,7 @@ def wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Generate, build and run the kernel
     code = FP8WGradGemmRuntime.generate(kwargs)
     runtime = build('wgrad_gemm_fp8_fp8_fp32_nt', code, FP8WGradGemmRuntime, kwargs)
-    runtime(kwargs)
+    runtime(**kwargs)
 
 
 def k_grouped_wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
