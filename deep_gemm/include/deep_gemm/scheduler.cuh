@@ -34,7 +34,7 @@ struct Scheduler {
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum;
 
-    __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
+    __device__ __forceinline__ explicit Scheduler(const uint32_t& shape_m,
                                                   int* grouped_layout = nullptr) {
         num_aligned_m_blocks = ceil_div(shape_m, BLOCK_M);
         if constexpr (kGemmType == GemmType::Normal) {
@@ -45,6 +45,17 @@ struct Scheduler {
         } else if (kGemmType == GemmType::GroupedMasked) {
             curr_group_idx = curr_cumsum = 0;
             this->grouped_layout = grouped_layout;
+        }
+    }
+
+    // ReSharper disable once CppNotAllPathsReturnValue
+    __device__ __forceinline__ bool is_computation_valid(const uint32_t& m_block_idx, const uint32_t& m_offset) const {
+        if constexpr (kGemmType == GemmType::Normal) {
+            return true;
+        } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
+            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) >= 0;
+        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + curr_group_idx);
         }
     }
 
@@ -65,7 +76,7 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx,
+    __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t& num_m_blocks, const uint32_t& block_idx,
                                                            uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNum1DBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
@@ -100,7 +111,7 @@ struct Scheduler {
     }
 
     template <bool kIgnoreGroupedForGroupedContiguous=true>
-    __device__ __forceinline__ uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
+    __device__ __forceinline__ uint32_t get_global_idx(const uint32_t& shape_dim, const uint32_t& block_size,
                                                        const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
         if constexpr (kGemmType == GemmType::Normal) {
             return block_idx * block_size;
