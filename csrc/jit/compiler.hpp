@@ -19,26 +19,9 @@ class Compiler {
     std::string library_version;
     std::filesystem::path library_root_path;
 
-    static void collect_files(const std::filesystem::path& dir,
-                        std::vector<std::filesystem::path>& out) {
-        // We met ABI breakage using std::filesystem::recursive_directory_iterator
-        // Use std::filesystem::directory_iterator instead
-        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-            if (entry.is_directory()) {
-                collect_files(entry.path(), out);
-            } else if (entry.is_regular_file() && entry.path().extension()==".cuh") {
-                out.emplace_back(entry.path());
-            }
-        }
-    }
-
     std::string get_library_version() const {
-        std::vector<std::filesystem::path> files;
-        collect_files(library_include_path / "deep_gemm", files);
-        std::sort(files.begin(), files.end());
-
         std::stringstream ss;
-        for (const auto& f : files) {
+        for (const auto& f: collect_files(library_include_path / "deep_gemm")) {
             std::ifstream in(f, std::ios::binary);
             ss << in.rdbuf();
         }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <random>
 #include <string>
 #include <memory>
@@ -39,6 +40,25 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
         output += buffer.data();
     const auto& exit_code = WEXITSTATUS(pclose(pipe.release()));
     return {exit_code, output};
+}
+
+static std::vector<std::filesystem::path> collect_files(const std::filesystem::path& root) {
+    std::vector<std::filesystem::path> files;
+    std::function<void(const std::filesystem::path&)> impl;
+    impl = [&](const std::filesystem::path& dir) {
+        for (const auto& entry: std::filesystem::directory_iterator(dir)) {
+            if (entry.is_directory()) {
+                impl(entry.path());
+            } else if (entry.is_regular_file() and entry.path().extension() == ".cuh") {
+                files.emplace_back(entry.path());
+            }
+        }
+    };
+    impl(root);
+
+    // Be consistent
+    std::sort(files.begin(), files.end());
+    return files;
 }
 
 static std::filesystem::path make_dirs(const std::filesystem::path& path) {
