@@ -90,11 +90,11 @@ if __name__ == '__main__':
         },
         ext_modules=[
             CUDAExtension(name='deep_gemm_cpp',
-                         sources=sources,
-                         include_dirs=build_include_dirs,
-                         libraries=build_libraries,
-                         library_dirs=build_library_dirs,
-                         extra_compile_args=cxx_flags)
+                          sources=sources,
+                          include_dirs=build_include_dirs,
+                          libraries=build_libraries,
+                          library_dirs=build_library_dirs,
+                          extra_compile_args=cxx_flags)
         ],
         zip_safe=False,
         cmdclass={
