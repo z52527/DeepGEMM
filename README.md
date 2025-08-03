@@ -24,7 +24,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [x] MoE scheduler with TMA multicast compatibility
 - [x] Fix TMA multicast compatibility for indivisible shapes
 - [x] Skip useless computation on M
-- [ ] NVRTC as a faster compiler
+- [x] NVRTC as a faster compiler
 - [ ] Sanitizer for testing
 - [x] Weight gradient kernels for dense models
 - [x] Weight gradient kernels for MoE models
@@ -46,8 +46,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - Python 3.8 or higher
 - Compilers with C++20 support
 - CUDA Toolkit:
-    - Currently, CUDA 12.8 or higher is required, but support for older versions may be added in the future
-    - CUDA 12.8 or higher for SM90
+    - CUDA 12.3 or higher for SM90
         - **We highly recommend 12.9 or higher for the best performance**
     - CUDA 12.9 or higher for SM100
 - PyTorch 2.1 or higher
@@ -114,6 +113,8 @@ The library provides some utility functions besides the above kernels:
 
 - `deep_gemm.set_num_sms`: set the maximum SM count to use
 - `deep_gemm.get_num_sms`: get the current SM maximum count (return the device SM count if not set)
+- `deep_gemm.set_tc_util`: set an approximated tensor core utilization ratio
+- `deep_gemm.get_tc_util`: get the current tensor core utilization ratio
 - `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into required layout
 - `deep_gemm.get_tma_aligned_size`: get the required TMA alignment size
 - `deep_gemm.get_mk_alignment_for_contiguous_layout`: get the group-level alignment requirement for grouped contiguous layout

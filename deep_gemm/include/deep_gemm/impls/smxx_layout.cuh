@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdint>
-
 #include <deep_gemm/common/utils.cuh>
 
 namespace deep_gemm {

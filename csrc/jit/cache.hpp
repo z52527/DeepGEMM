@@ -9,7 +9,7 @@
 namespace deep_gemm {
 
 class KernelRuntimeCache {
-    std::unordered_map<std::filesystem::path, std::shared_ptr<KernelRuntime>> cache;
+    std::unordered_map<std::string, std::shared_ptr<KernelRuntime>> cache;
 
 public:
     // TODO: consider cache capacity

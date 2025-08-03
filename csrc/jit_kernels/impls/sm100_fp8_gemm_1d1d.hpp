@@ -32,13 +32,6 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#ifdef __CUDACC_RTC__
-#include <deep_gemm/nvrtc_std.cuh>
-#else
-#include <cuda.h>
-#include <string>
-#endif
-
 #include <deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
@@ -54,7 +47,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
 )",
@@ -66,14 +59,13 @@ static void __instantiate_kernel() {{
         args.gemm_config.num_stages, args.gemm_config.num_last_stages,
         args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
-        to_string(args.gemm_config.gemm_type),
-        args.gemm_config.with_accumulation,
-        to_string(args.gemm_config.cd_dtype));
+        args.gemm_config.num_sms,
+        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype));
     }
 
-    static void launch_impl(const cudaKernel_t& kernel, const cudaLaunchConfig_t& config, Args args) {
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
-        DG_CUDA_RUNTIME_CHECK(cudaLaunchKernelEx(&config, kernel,
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.grouped_layout, args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
@@ -286,7 +278,7 @@ static void fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     const auto& num_groups = static_cast<int>(ks.size());
 
     // Get config using max K for better performance
-    const auto& max_k = *std::ranges::max_element(ks);
+    const auto& max_k = *std::max_element(ks.begin(), ks.end());
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::KGroupedContiguous, KernelType::Kernel1D1D,
         m, n, max_k, num_groups, cute::UMMA::Major::MN, cute::UMMA::Major::MN,
@@ -316,9 +308,9 @@ static void fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                                 static_cast<int>(cd.stride(1)), num_groups,
                                                 config.smem_config.swizzle_cd_mode);
     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, sum_sf_k * 512,
-                                                  config.block_m, config.block_k, num_groups, 0);
+                                                  config.block_m, config.block_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k * 512,
-                                                  config.block_n, config.block_k, num_groups, 0);
+                                                  config.block_n, config.block_k, 1, 0);
 
     // Duplicate the accumulator if necessary
     if (c.has_value()) {

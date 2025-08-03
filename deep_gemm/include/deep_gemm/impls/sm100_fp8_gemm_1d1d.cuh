@@ -20,22 +20,23 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumStages, uint32_t kNumLastStages,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
+          uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                         const __grid_constant__ CUtensorMap tensor_map_a,
-                         const __grid_constant__ CUtensorMap tensor_map_b,
-                         const __grid_constant__ CUtensorMap tensor_map_sfa,
-                         const __grid_constant__ CUtensorMap tensor_map_sfb,
-                         const __grid_constant__ CUtensorMap tensor_map_c,
-                         const __grid_constant__ CUtensorMap tensor_map_d) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_c,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // GEMM with accumulation must have FP32 output
     if constexpr (kWithAccumulation)
-        DG_STATIC_ASSERT(std::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
+        DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
 
     // Configs
     constexpr uint32_t LAYOUT_AD_M = 128;
@@ -63,7 +64,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // 2-CTA MMA
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
-    constexpr uint32_t STORE_BLOCK_M = std::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
+    constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M and BLOCK_M % LAYOUT_AD_M == 0, "Only support tensor memory layout A/D");
@@ -95,6 +96,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
     // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == 0) {
+        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
@@ -173,7 +175,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA>(shape_m, shape_n, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, grouped_layout);
 
     // For pipeline unrolling
     struct DivisibleK {};
@@ -207,7 +209,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                 #pragma unroll
@@ -329,7 +331,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                 // Launch MMAs
                 launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
-                    constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                    constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                     const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                     #pragma unroll
@@ -342,7 +344,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         // NOTES: CUTLASS UTCCP's interface does not have `elect_one_sync`, we must do it by ourselves
                         const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
                         if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
-                            using cute_utccp_t = std::conditional_t<kNumMulticast == 1,
+                            using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
                                 cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
 
                             // SFA and SFB copy
@@ -363,7 +365,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         __syncwarp();
 
                         // Issue UMMA in the leader CTA
-                        using cute_mma_t = std::conditional_t<kNumMulticast == 1,
+                        using cute_mma_t = cute::conditional_t<kNumMulticast == 1,
                             cute::SM100_MMA_MXF8F6F4_SS      <cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
                                                               cutlass::float_ue8m0_t, UMMA_M, UMMA_N, kMajorA, kMajorB>,
                             cute::SM100_MMA_MXF8F6F4_2x1SM_SS<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
@@ -416,7 +418,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                 #pragma unroll
@@ -530,7 +532,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                             // Load from tensor memory, store into shared memory
                             uint32_t values[kNumElemsPerBankGroup];
-                            if constexpr (std::is_same_v<cd_dtype_t, float>) {
+                            if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                                 // For FP32 output, read and store
                                 DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
                                 cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
@@ -539,7 +541,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
                             } else {
                                 // For BF16 output, read, cast and store
-                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and std::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
+                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
                                 cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
                                     values[0], values[1], values[2], values[3],
                                     values[4], values[5], values[6], values[7]);
@@ -564,7 +566,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         cute::tma_store_fence();
                         cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
                         if (epilogue_thread_idx == 0) {
-                            using cute_tma_t = std::conditional_t<kWithAccumulation,
+                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                 cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                             cute_tma_t::copy(&tensor_map_d, smem_cd[tma_stage_idx], n_idx, m_idx);
                             cute::tma_store_arrive();

@@ -21,14 +21,15 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumStages, uint32_t kNumLastStages,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
+          uint32_t kNumSMs,
           GemmType kGemmType, typename cd_dtype_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                         const __grid_constant__ CUtensorMap tensor_map_a,
-                         const __grid_constant__ CUtensorMap tensor_map_b,
-                         const __grid_constant__ CUtensorMap tensor_map_d,
-                         const __grid_constant__ CUtensorMap tensor_map_sfa) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -61,7 +62,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // 2-CTA MMA
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
-    constexpr uint32_t STORE_BLOCK_M = std::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
+    constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M and BLOCK_M % LAYOUT_AD_M == 0, "Only support tensor memory layout A/D");
@@ -87,6 +88,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == 0) {
+        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_d);
@@ -171,7 +173,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA>(shape_m, shape_n, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, grouped_layout);
 
     // Register configurations
     constexpr uint32_t kNumNonEpilogueRegisters = 64;
@@ -187,7 +189,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             launch_k_iterations([&](uint32_t k_iter, auto type) {
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
                 DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
@@ -276,7 +278,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // Launch MMAs
             launch_k_iterations([&](uint32_t k_iter, auto type) {
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
                 DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
@@ -293,7 +295,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                     // Issue UMMA in the leader CTA
                     if (s < kNumInnerStages) {
-                        using cute_mma_t = std::conditional_t<kNumMulticast == 1,
+                        using cute_mma_t = cute::conditional_t<kNumMulticast == 1,
                             cute::SM100_MMA_F8F6F4_SS, cute::SM100_MMA_F8F6F4_2x1SM_SS>;
                         tcgen05_after_thread_sync();
                         #pragma unroll
@@ -366,7 +368,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Launch promotion
             float accum[BLOCK_N] = {0};
             launch_k_iterations([&](uint32_t k_iter, auto type) {
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
                 DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
@@ -474,7 +476,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     // Load from tensor memory, store into shared memory
                     // NOTES: if you want to do accumulation, please notice that you need two accumulation barriers
                     const auto offset = s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
-                    if constexpr (std::is_same_v<cd_dtype_t, float>) {
+                    if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                         // For FP32 output, read and store
                         DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
                         st_shared(smem_ptr,
@@ -484,7 +486,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                                   *reinterpret_cast<uint32_t*>(&accum[offset + 3]));
                     } else {
                         // For BF16 output, read, cast and store
-                        DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and std::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
+                        DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
                         st_shared(smem_ptr,
                                   cast_into_bf16_and_pack(accum[offset + 0], accum[offset + 1]),
                                   cast_into_bf16_and_pack(accum[offset + 2], accum[offset + 3]),

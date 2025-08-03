@@ -62,8 +62,9 @@ struct GemmConfig {
     int block_m, block_n, block_k;
     int num_stages, num_last_stages;
 
-    // Runtime configs
+    // Templated device configs
     int num_sms;
+    int tc_util;
 
     // Structured configs
     MulticastConfig multicast_config;
@@ -265,30 +266,35 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .num_stages = best_num_stages,
         .num_last_stages = ceil_div(k, block_k) % best_num_stages,
         .num_sms = num_min_sms,
+        .tc_util = device_runtime->get_tc_util(),
         .multicast_config = best_multicast_config,
         // ReSharper disable once CppLocalVariableMightNotBeInitialized
         .smem_config = best_smem_config,
         .thread_config = ArchSpec::get_thread_config(kernel_type, best_block_m, best_block_n)
     };
 
+    // Only SM100 BF16 kernels support tensor core control
+    if (config.tc_util < 100)
+        DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and ab_dtype == torch::kBFloat16);
+
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         auto key = std::make_tuple(gemm_type, kernel_type, m, n, k, num_groups, major_a, major_b,
                                    ab_dtype, cd_dtype, with_accumulation, num_sms);
         static std::set<decltype(key)> printed;
-        if (not printed.contains(key)) {
-            printf("Gemm type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
+        if (printed.count(key) == 0) {
+            printf("GEMM type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
                    "A major: %d, B major: %d, AB dtype: %s, CD dtype: %s, accumulation: %d, "
                    "SM limit: %d -> block M: %d, block N: %d, block K: %d, stages: %d, last stages: %d, "
                    "SMs: %d, multicast: %d, multicast on A: %d, shared memory: %d bytes, swizzle A: %d, "
-                   "swizzle B: %d, swizzle CD: %d, threads: %d\n",
+                   "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
                    static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
                    static_cast<int>(major_a), static_cast<int>(major_b), c10::toString(ab_dtype), c10::toString(cd_dtype),
                    static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, block_k,
                    best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
                    static_cast<int>(best_multicast_config.is_multicast_on_a),
                    best_smem_config.smem_size, best_smem_config.swizzle_a_mode, best_smem_config.swizzle_b_mode,
-                   best_smem_config.swizzle_cd_mode, config.thread_config.num_threads);
+                   best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, config.tc_util);
             printed.insert(key);
         }
     }

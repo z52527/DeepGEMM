@@ -2,12 +2,14 @@ import os
 import setuptools
 import shutil
 import subprocess
+import torch
 from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi']
+cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
+             f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 sources = ['csrc/python_api.cpp']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
@@ -15,7 +17,7 @@ build_include_dirs = [
     'third-party/cutlass/include',
     'third-party/fmt/include',
 ]
-build_libraries = ['cuda', 'cudart']
+build_libraries = ['cuda', 'cudart', 'nvrtc']
 build_library_dirs = [
     f'{CUDA_HOME}/lib64',
     f'{CUDA_HOME}/lib64/stubs'
@@ -40,7 +42,7 @@ class CustomBuildPy(build_py):
     def generate_default_envs(self):
         code = '# Pre-installed environment variables\n'
         code += 'persistent_envs = dict()\n'
-        for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_DISABLE_SHORTCUT_CACHE'):
+        for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_CPP_STANDARD'):
             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
 
         with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
@@ -78,9 +80,6 @@ if __name__ == '__main__':
         name='deep_gemm',
         version='2.0.0' + revision,
         packages=find_packages('.'),
-        install_requires=[
-            'torch>=2.1.0',
-        ],
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',

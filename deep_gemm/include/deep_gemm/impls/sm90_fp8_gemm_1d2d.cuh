@@ -36,14 +36,14 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumStages, uint32_t kNumLastStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
-          GemmType kGemmType>
-__global__ void __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
+          uint32_t kNumSMs, GemmType kGemmType>
+__global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                        const __grid_constant__ CUtensorMap tensor_map_a,
-                        const __grid_constant__ CUtensorMap tensor_map_b,
-                        const __grid_constant__ CUtensorMap tensor_map_d,
-                        const __grid_constant__ CUtensorMap tensor_map_sfa) {
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -77,10 +77,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == kNumMathThreads) {
         // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
-        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_a));
-        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_b));
-        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_sfa));
-        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_d));
+        cute::prefetch_tma_descriptor(&tensor_map_a);
+        cute::prefetch_tma_descriptor(&tensor_map_b);
+        cute::prefetch_tma_descriptor(&tensor_map_sfa);
+        cute::prefetch_tma_descriptor(&tensor_map_d);
     }
     __syncwarp();
 
@@ -168,7 +168,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA>(shape_m, shape_n, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, grouped_layout);
 
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
@@ -179,7 +179,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 launch_k_iterations([&](uint32_t k_iter, auto divisible_type, auto _, auto __) {
-                    constexpr bool kHasDivisibleStages = std::is_same_v<decltype(divisible_type), DivisibleK>;
+                    constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(divisible_type), DivisibleK>;
                     constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
 
                     // Assign TMA multicast number into A and B
@@ -278,8 +278,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
             // Launch MMAs
             launch_k_iterations([&](uint32_t k_iter, auto divisible_type, auto skip_type, auto _) {
-                constexpr bool kSkipComputation = std::is_same_v<decltype(skip_type), SkipComputation>;
-                constexpr bool kHasDivisibleStages = std::is_same_v<decltype(divisible_type), DivisibleK>;
+                constexpr bool kSkipComputation = cute::is_same_v<decltype(skip_type), SkipComputation>;
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(divisible_type), DivisibleK>;
                 constexpr uint32_t kNumInnerStages = kSkipComputation ? 0 : (kHasDivisibleStages ? kNumStages : kNumLastStages);
 
                 #pragma unroll

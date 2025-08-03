@@ -1,14 +1,17 @@
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 #include <filesystem>
 #include <fstream>
+#include <nvrtc.h>
 #include <regex>
 #include <string>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/hash.hpp"
+#include "../utils/lazy_init.hpp"
 #include "../utils/system.hpp"
 #include "cache.hpp"
 #include "device_runtime.hpp"
@@ -16,10 +19,13 @@
 namespace deep_gemm {
 
 class Compiler {
-    std::string library_version;
-    std::filesystem::path library_root_path;
+public:
+    static std::filesystem::path library_root_path;
+    static std::filesystem::path library_include_path;
+    static std::filesystem::path cuda_home;
+    static std::string library_version;
 
-    std::string get_library_version() const {
+    static std::string get_library_version() {
         std::stringstream ss;
         for (const auto& f: collect_files(library_include_path / "deep_gemm")) {
             std::ifstream in(f, std::ios::binary);
@@ -28,16 +34,23 @@ class Compiler {
         return get_hex_digest(ss.str());
     }
 
-public:
+    static void prepare_init(const std::string& library_root_path,
+                             const std::string& cuda_home_path_by_torch) {
+        Compiler::library_root_path = library_root_path;
+        Compiler::library_include_path = Compiler::library_root_path / "include";
+        Compiler::cuda_home = cuda_home_path_by_torch;
+        Compiler::library_version = get_library_version();
+    }
+
     std::string signature, flags;
-    std::filesystem::path library_include_path;
     std::filesystem::path cache_dir_path;
 
-    explicit Compiler(const std::filesystem::path& library_root_path) {
-        // Static library paths
-        this->library_root_path = library_root_path;
-        this->library_include_path = library_root_path / "include";
-        this->library_version = get_library_version();
+    Compiler() {
+        // Check `prepare_init`
+        DG_HOST_ASSERT(not library_root_path.empty());
+        DG_HOST_ASSERT(not library_include_path.empty());
+        DG_HOST_ASSERT(not cuda_home.empty());
+        DG_HOST_ASSERT(not library_version.empty());
 
         // Cache settings
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
@@ -46,10 +59,11 @@ public:
 
         // The compiler flags applied to all derived compilers
         signature = "unknown-compiler";
-        std::string ptxas_flags = "--ptxas-options=--register-usage-level=10";
-        if (get_env<int>("DG_JIT_PTXAS_VERBOSE", 0))
-            ptxas_flags += ",--verbose";
-        flags = fmt::format("-std=c++20 --diag-suppress=39,161,174,177,186,940 {}", ptxas_flags);
+        flags = fmt::format("-std=c++{} --diag-suppress=39,161,174,177,186,940 "
+                            "--ptxas-options=--register-usage-level=10",
+                            get_env<int>("DG_JIT_CPP_STANDARD", 20));
+        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
+            flags += " --ptxas-options=--verbose";
     }
 
     virtual ~Compiler() = default;
@@ -102,6 +116,11 @@ public:
     virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const = 0;
 };
 
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuda_home);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_version);
+
 class NVCCCompiler final: public Compiler {
     std::filesystem::path nvcc_path;
 
@@ -125,11 +144,9 @@ class NVCCCompiler final: public Compiler {
     }
 
 public:
-    NVCCCompiler(const std::filesystem::path& library_root_path,
-                 const std::filesystem::path& cuda_home_path_by_torch):
-            Compiler(library_root_path) {
+    NVCCCompiler() {
         // Override the compiler signature
-        nvcc_path = cuda_home_path_by_torch / "bin" / "nvcc";
+        nvcc_path = cuda_home / "bin" / "nvcc";
         if (const auto& env_nvcc_path = get_env<std::string>("DG_JIT_NVCC_COMPILER"); not env_nvcc_path.empty())
             nvcc_path = env_nvcc_path;
         const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();
@@ -150,10 +167,10 @@ public:
         // Compile
         const auto& command = fmt::format("{} {} -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-            printf("Running NVCC command: %s", command.c_str());
+            printf("Running NVCC command: %s\n", command.c_str());
         const auto& [return_code, output] = call_external_command(command);
         if (return_code != 0) {
-            printf("NVCC compilation failed: %s", output.c_str());
+            printf("NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");
         }
 
@@ -163,6 +180,96 @@ public:
     }
 };
 
-static std::shared_ptr<Compiler> compiler = nullptr;
+class NVRTCCompiler final: public Compiler {
+public:
+    NVRTCCompiler() {
+        // Override the compiler signature
+        int major, minor;
+        DG_NVRTC_CHECK(nvrtcVersion(&major, &minor));
+        signature = fmt::format("NVRTC{}.{}", major, minor);
+
+        // Build include directories list
+        std::string include_dirs;
+        include_dirs += fmt::format("-I{} ", library_include_path.string());
+        include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+
+        // Add PCH support for version 12.8 and above
+        // NOTES: PCH is vital for compilation speed
+        std::string pch_flags;
+        if (major > 12 or (major == 12 and minor >= 8)) {
+            pch_flags = "--pch ";
+            if (get_env<int>("DG_JIT_DEBUG", 0))
+                pch_flags += "--pch-verbose=true ";
+        }
+
+        // Override the compiler flags
+        flags = fmt::format("{} {}--gpu-architecture=sm_{}a -default-device {}",
+                            flags, include_dirs, device_runtime->get_arch(), pch_flags);
+    }
+
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {
+        // Write the code into the cache directory
+        const auto& code_path = dir_path / "kernel.cu";
+        put(code_path, code);
+
+        // Parse compilation options
+        std::istringstream iss(flags);
+        std::vector<std::string> options;
+        std::string option;
+        while (iss >> option)
+            options.push_back(option);
+
+        // Convert to C-style string array for NVRTC
+        std::vector<const char*> option_cstrs;
+        for (const auto& opt: options)
+            option_cstrs.push_back(opt.c_str());
+
+        // Print compiler command if requested
+        if (get_env<int>("DG_JIT_DEBUG", 0) or get_env<int>("DG_JIT_PRINT_COMPILER_COMMAND", 0)) {
+            printf("Compiling JIT runtime with NVRTC options: ");
+            for (const auto& opt: options)
+                printf("%s ", opt.c_str());
+            printf("\n");
+        }
+
+        // Create NVRTC program and compile
+        nvrtcProgram program;
+        DG_NVRTC_CHECK(nvrtcCreateProgram(&program, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
+        const auto& compile_result = nvrtcCompileProgram(program, static_cast<int>(option_cstrs.size()), option_cstrs.data());
+
+        // Get and print compiler log
+        size_t log_size;
+        DG_NVRTC_CHECK(nvrtcGetProgramLogSize(program, &log_size));
+        if (get_env<int>("DG_JIT_DEBUG", 0) or compile_result != NVRTC_SUCCESS) {
+            if (compile_result != NVRTC_SUCCESS)
+                DG_HOST_ASSERT(log_size > 1);
+            if (log_size > 1) {
+                std::string compilation_log(log_size, '\0');
+                DG_NVRTC_CHECK(nvrtcGetProgramLog(program, compilation_log.data()));
+                printf("NVRTC log: %s\n", compilation_log.c_str());
+            }
+        }
+
+        // Get CUBIN size and data
+        size_t cubin_size;
+        DG_NVRTC_CHECK(nvrtcGetCUBINSize(program, &cubin_size));
+        std::string cubin_data(cubin_size, '\0');
+        DG_NVRTC_CHECK(nvrtcGetCUBIN(program, cubin_data.data()));
+
+        // Write into the file system
+        put(cubin_path, cubin_data);
+
+        // Cleanup
+        DG_NVRTC_CHECK(nvrtcDestroyProgram(&program));
+    }
+};
+
+static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
+    if (get_env<int>("DG_JIT_USE_NVRTC", 0)) {
+        return std::make_shared<NVRTCCompiler>();
+    } else {
+        return std::make_shared<NVCCCompiler>();
+    }
+});
 
 } // namespace deep_gemm

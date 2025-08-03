@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <cute/arch/mma_sm90_gmma.hpp>
 #include <cute/arch/mma_sm90_gmma_ext.hpp>
 
@@ -10,13 +9,13 @@ template <int N_, typename MMA>
 struct FP8MMA {
 
     template <size_t ...Idx>
-    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, std::index_sequence<Idx...>) {
+    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
         using namespace cute::SM90::GMMA;
         MMA::fma(desc_a, desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
     }
 
     __forceinline__ __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d) {
-        call_fma_impl(desc_a, desc_b, d, scale_d, std::make_index_sequence<N_/2>{});
+        call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
     }
 
     static constexpr int M = 64;
@@ -139,7 +138,7 @@ __device__ GmmaDescriptor make_smem_desc(PointerType smem_ptr, const int& layout
 
 __device__ __forceinline__ void
 tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
-         const uint32_t& crd_0, const uint32_t& crd_1, const uint32_t& num_tma_multicast) {
+         const uint32_t& crd_0, const uint32_t& crd_1, const uint32_t& num_tma_multicast = 1) {
     constexpr auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
     if (num_tma_multicast == 1) {
         cute::SM90_TMA_LOAD_2D::copy(desc_ptr, barrier_ptr, cache_hint, smem_ptr, crd_0, crd_1);
