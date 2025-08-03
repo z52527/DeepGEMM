@@ -14,12 +14,16 @@ class KernelType(enum.Enum):
     # For SM100 GEMMs
     Kernel1D1D = 0
     Kernel1D2D = 1
+    KernelNoSF = 2
 
     def is_1d1d(self):
         return self.value == 0
 
     def is_1d2d(self):
         return self.value == 1
+
+    def is_nosf(self):
+        return self.value == 2
 
 
 class MajorTypeAB(enum.Enum):
@@ -44,7 +48,9 @@ def get_ue8m0_usage(kernel_type: KernelType) -> bool:
     return kernel_type.is_1d1d()
 
 
-def get_kernel_types() -> tuple:
+def get_kernel_types(use_bf16: bool = False) -> tuple:
+    if use_bf16:
+        return (KernelType.KernelNoSF, )
     return (KernelType.Kernel1D2D, ) if get_arch_major() == 9 else (KernelType.Kernel1D1D, KernelType.Kernel1D2D)
 
 
@@ -61,13 +67,13 @@ def get_major_ab(freeze_a: bool) -> tuple:
            (MajorTypeAB.MNMajor, MajorTypeAB.KMajor), (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
 
 
-def enumerate_normal() -> Generator:
-    for kernel_type in get_kernel_types():
+def enumerate_normal(use_bf16: bool = False) -> Generator:
+    for kernel_type in get_kernel_types(use_bf16):
         for m in (128, 4096):
-            for n, k in [(2112, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]:
+            for n, k in [(2112, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048), (129280, 7168)]:
                 for major_a, major_b in get_major_ab(False):
                     for out_dtype in get_out_dtype():
-                        for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+                        for accumulate in (False, ) if out_dtype == torch.bfloat16 or not kernel_type.is_1d1d() else (False, True):
                             yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
 
 
@@ -123,13 +129,18 @@ def enumerate_k_grouped_sf_layout():
 def generate_normal(m: int, n: int, k: int,
                     major_a: MajorTypeAB, major_b: MajorTypeAB,
                     accumulate: bool, out_dtype: torch.dtype,
-                    use_ue8m0: bool):
+                    use_ue8m0: bool = False, use_bf16: bool = False):
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
     c = d if accumulate else None
     ref_d = (a.float() @ b.float().t() + (c if accumulate else 0)).to(out_dtype)
+
+    if use_bf16:
+        a = a if major_a.is_k_major() else a.T.contiguous().T
+        b = b if major_b.is_k_major() else b.T.contiguous().T
+        return a, b, c, d, ref_d
 
     a_fp8, b_fp8 = per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0), per_block_cast_to_fp8(b, use_ue8m0=use_ue8m0)
     a_fp8 = a_fp8 if major_a.is_k_major() else (a_fp8[0].T.contiguous().T, a_fp8[1])

@@ -2,6 +2,11 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda/std/cstdint>
+#include <cuda/std/utility>
+#include <cute/container/tuple.hpp>
+
+#include "cute_tie.cuh"
 
 #ifdef __CLION_IDE__
 
@@ -133,6 +138,10 @@ template <typename old_t>
 __device__ __forceinline__ int cast_into_bf16_and_pack(old_t& x, old_t& y) {
     auto bf16x2 = __float22bfloat162_rn({*reinterpret_cast<float*>(&x), *reinterpret_cast<float*>(&y)});
     return *reinterpret_cast<int*>(&bf16x2);
+}
+
+__device__ __forceinline__ void prefetch_l1(void *ptr) {
+    asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
 } // namespace `deep_gemm`

@@ -1,12 +1,10 @@
 #pragma once
 
-#include <cuda_runtime.h>
-#include <filesystem>
-
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
 #include "../utils/system.hpp"
 #include "device_runtime.hpp"
+#include "handle.hpp"
 
 namespace deep_gemm {
 
@@ -23,19 +21,17 @@ struct LaunchArgs {
         grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
 };
 
-template <typename T>
-concept HasLaunchArgs = requires (const T& t) {
-    { t.launch_args } -> std::convertible_to<decltype(t.launch_args)>;
-};
-
 class KernelRuntime final {
 public:
     static std::filesystem::path cuda_home;
 
-    cudaLibrary_t library;
-    cudaKernel_t kernel;
+    LibraryHandle library;
+    KernelHandle kernel;
 
     explicit KernelRuntime(const std::filesystem::path& dir_path) {
+        // Check `prepare_init`
+        DG_HOST_ASSERT(not cuda_home.empty());
+
         // NOLINT(*-pro-type-member-init)
         const auto& cuobjdump_path = cuda_home / "bin" / "cuobjdump";
         const auto& cubin_path = dir_path / "kernel.cubin";
@@ -50,7 +46,8 @@ public:
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line); ) {
-            if (line.find("STT_FUNC") == 0 and std::ranges::none_of(illegal_names, [&](const auto& name) { return line.find(name) != std::string::npos; })) {
+            if (line.find("STT_FUNC") == 0 and std::none_of(illegal_names.begin(), illegal_names.end(),
+                [&](const auto& name) { return line.find(name) != std::string::npos; })) {
                 const auto& last_space = line.rfind(' ');
                 symbol_names.push_back(line.substr(last_space + 1));
             }
@@ -64,11 +61,10 @@ public:
 
         // Load from the library
         DG_HOST_ASSERT(symbol_names.size() == 1);
-        DG_CUDA_RUNTIME_CHECK(cudaLibraryLoadFromFile(&library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
-        DG_CUDA_RUNTIME_CHECK(cudaLibraryGetKernel(&kernel, library, symbol_names[0].c_str()));
+        kernel = load_kernel(cubin_path, symbol_names[0], &library);
     }
 
-    static void set_cuda_home(const std::string& cuda_home_path_by_torch) {
+    static void prepare_init(const std::string& cuda_home_path_by_torch) {
         cuda_home = cuda_home_path_by_torch;
     }
 
@@ -78,18 +74,16 @@ public:
     }
 
     ~KernelRuntime() noexcept(false) {
-        const auto& error = cudaLibraryUnload(library);
-        DG_HOST_ASSERT(error == cudaSuccess or error == cudaErrorCudartUnloading);
+        unload_library(library);
     }
 };
 
-// Declare after defining
-decltype(KernelRuntime::cuda_home) KernelRuntime::cuda_home;
+DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, cuda_home);
 
 template <typename Derived>
 class LaunchRuntime {
 public:
-    template <typename Args> requires HasLaunchArgs<Args>
+    template <typename Args>
     static std::string generate(const Args& args) {
         const auto& code = Derived::generate_impl(args);
         if (get_env<int>("DG_JIT_DEBUG", 0))
@@ -97,34 +91,18 @@ public:
         return code;
     }
 
-    template <typename Args> requires HasLaunchArgs<Args>
+    template <typename Args>
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         const auto& kernel = kernel_runtime->kernel;
         const auto& stream = at::cuda::getCurrentCUDAStream();
         const LaunchArgs& launch_args = args.launch_args;
 
-        // Set dynamic shared memory size
-        if (launch_args.smem_size > 0)
-            DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, launch_args.smem_size));
-
-        // Launch config
-        cudaLaunchConfig_t config;
-        config.gridDim = {static_cast<unsigned>(launch_args.grid_dim.first),
-                          static_cast<unsigned>(launch_args.grid_dim.second),
-                          1};
-        config.blockDim = {static_cast<unsigned>(launch_args.num_threads), 1, 1};
-        config.dynamicSmemBytes = launch_args.smem_size;
-        config.stream = stream;
-        config.numAttrs = 0;
-
-        // Clusters
-        cudaLaunchAttribute attr;
-        if (launch_args.cluster_dim > 1) {
-            attr.id = cudaLaunchAttributeClusterDimension;
-            attr.val.clusterDim = {static_cast<unsigned>(launch_args.cluster_dim), 1, 1};
-            config.attrs = &attr;
-            config.numAttrs = 1;
-        }
+        const dim3& grid_dim = {static_cast<unsigned>(launch_args.grid_dim.first),
+                                static_cast<unsigned>(launch_args.grid_dim.second),
+                                1};
+        const dim3& block_dim = {static_cast<unsigned>(launch_args.num_threads), 1, 1};
+        auto config = construct_launch_config(kernel, stream, launch_args.smem_size,
+                                              grid_dim, block_dim, launch_args.cluster_dim);
 
         // Launch in the derived class
         if (get_env<int>("DG_JIT_DEBUG")) {

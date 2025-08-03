@@ -12,6 +12,7 @@ enum class GemmType {
 enum class KernelType {
     Kernel1D1D = 0,
     Kernel1D2D = 1,
+    KernelNoSF = 2
 };
 
 } // namespace deep_gemm

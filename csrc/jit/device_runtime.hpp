@@ -3,11 +3,12 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "../utils/exception.hpp"
+#include "../utils/lazy_init.hpp"
 
 namespace deep_gemm {
 
 class DeviceRuntime {
-    int num_sms = 0;
+    int num_sms = 0, tc_util = 0;
     std::shared_ptr<cudaDeviceProp> cached_prop;
 
 public:
@@ -43,8 +44,17 @@ public:
             num_sms = get_prop()->multiProcessorCount;
         return num_sms;
     }
+
+    void set_tc_util(const int& new_tc_util) {
+        DG_HOST_ASSERT(0 <= new_tc_util and new_tc_util <= 100);
+        tc_util = new_tc_util;
+    }
+
+    int get_tc_util() const {
+        return tc_util == 0 ? 100 : tc_util;
+    }
 };
 
-static auto device_runtime = std::make_shared<DeviceRuntime>();
+static auto device_runtime = LazyInit<DeviceRuntime>([](){ return std::make_shared<DeviceRuntime>(); });
 
 } // namespace deep_gemm

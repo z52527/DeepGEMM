@@ -29,13 +29,6 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#ifdef __CUDACC_RTC__
-#include <deep_gemm/nvrtc_std.cuh>
-#else
-#include <cuda.h>
-#include <string>
-#endif
-
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
@@ -49,7 +42,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -61,12 +54,12 @@ static void __instantiate_kernel() {{
         args.gemm_config.num_stages, args.gemm_config.num_last_stages,
         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
-        to_string(args.gemm_config.gemm_type));
+        args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type));
     }
 
-    static void launch_impl(const cudaKernel_t& kernel, const cudaLaunchConfig_t& config, Args args) {
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
-        DG_CUDA_RUNTIME_CHECK(cudaLaunchKernelEx(&config, kernel,
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.sfb, args.grouped_layout,
             args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,

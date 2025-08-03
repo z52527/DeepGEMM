@@ -11,14 +11,28 @@ enum class KGroupedIndexType {
     SF_K,
 };
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumSMs, bool isMulticastOnA>
+static constexpr uint32_t get_num_1d_blocks_per_group() {
+    // Select the best from candidates
+    uint32_t num_best_blocks = 0, min_usage = cute::numeric_limits<uint32_t>::max();
+    for (const auto& candidate: {8u, 16u}) {
+        const auto& usage = isMulticastOnA ?
+            candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N
+            candidate * BLOCK_M + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_N; // Grouping on M
+        if (usage < min_usage)
+            min_usage = usage, num_best_blocks = candidate;
+    }
+    return num_best_blocks;
+}
+
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 template <GemmType kGemmType,
           uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumGroups,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
-          // TODO: refactor this by other values
-          uint32_t kNum1DBlocksPerGroup = 16>
+          uint32_t kNumSMs,
+          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
 struct Scheduler {
     int current_iter = -1;
 
@@ -88,6 +102,7 @@ struct Scheduler {
 #endif
 
         // Convert to final M/N block indices
+        // `kIsMulticastOnA == true` leads to groups on N
         if constexpr (kIsMulticastOnA) {
             m_block_idx = in_group_idx / num_blocks_in_group;
             n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
@@ -103,7 +118,7 @@ struct Scheduler {
         if constexpr (kGemmType == GemmType::Normal) {
             return block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
-            const auto offset = kWithGroupOffset ? std::max(0, __ldg(grouped_layout + m_block_idx * BLOCK_M)) : 0;
+            const auto offset = kWithGroupOffset ? cute::max(0, __ldg(grouped_layout + m_block_idx * BLOCK_M)) : 0;
             return offset * shape_dim + block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             const auto offset = kWithGroupOffset ? current_group_idx : 0;
@@ -123,7 +138,7 @@ struct Scheduler {
     }
 
     __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
+        const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
             while (true) {

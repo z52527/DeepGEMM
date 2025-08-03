@@ -7,7 +7,7 @@ cd "$script_dir"
 ln -sf $script_dir/third-party/cutlass/include/cutlass deep_gemm/include
 ln -sf $script_dir/third-party/cutlass/include/cute deep_gemm/include
 
-# Remove old dist file, build, and build
+# Remove old dist file, build files, and build
 rm -rf build dist
 rm -rf *.egg-info
 python setup.py build

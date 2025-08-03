@@ -44,6 +44,11 @@ struct SM100ArchSpec {
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
                                     const int& block_m, const int& block_n) {
+        // TODO: consider more carefully for BF16 GEMMs
+        // 2SM BF16 UMMA does not support `N % 32 != 0`
+        if (ab_dtype == torch::kBFloat16 and block_n % 32 != 0)
+            return false;
+
         // Layout A/D does not support `block_m == 64` and `block_n % 16 != 0`
         if (block_m == 64 or block_n % 16 != 0)
             return false;
@@ -68,7 +73,7 @@ struct SM100ArchSpec {
 
         // NOTES: when B is MN-major, we restrict `block_n` to multiples of 64,
         // since TMA performance degrades when `swizzle_b <= 32B` (i.e., when `block_ns % 64 != 0`), even with 3D TMA
-        return major_b == cute::UMMA::Major::K or block_n % 64 == 0;
+        return major_b == cute::UMMA::Major::K or (block_n * c10::elementSize(ab_dtype)) % 64 == 0;
     }
 
     static bool is_num_stages_legal(const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
@@ -93,7 +98,7 @@ struct SM100ArchSpec {
 
     static ThreadConfig get_thread_config(const KernelType& kernel_type,
                                           const int& block_m, const int& block_n) {
-        return ThreadConfig::sm100(128, kernel_type == KernelType::Kernel1D1D ? 128 : block_m);
+        return ThreadConfig::sm100(128, kernel_type == KernelType::Kernel1D2D ? block_m : 128);
     }
 
     static int get_smem_cd_size(const KernelType& kernel_type,
