@@ -513,13 +513,11 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         }
 
         // Flush all stages in the pipeline to make TMA stores visible to the next kernel
-        // TODO: do we actually need this?
         if (epilogue_thread_idx_in_warpgroup == 0)
             cute::tma_store_wait<0>();
 
         // Deallocate tensor memory by warp 1
         // NOTES: warp 0 is waiting TMA store
-        // TODO: do we need 2 SM allocation?
         if (epilogue_warp_idx == 1)
             Allocator().free(0, kNumTmemCols);
     }
