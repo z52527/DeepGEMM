@@ -319,27 +319,27 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         
         // ========== 制作指令描述符 ==========
         // TODO: 重构 UMMA_M 计算
-        constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
-        constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
-        constexpr uint32_t UMMA_K = 32 / sizeof(cutlass::float_e4m3_t);
-        auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<cutlass::float_e4m3_t, cutlass::float_e4m3_t,
-                                                                   float, cutlass::float_ue8m0_t,
-                                                                   UMMA_M, UMMA_N, kMajorA, kMajorB>();
-        auto sf_desc = make_sf_desc(nullptr);
+        // constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
+        // constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
+        // constexpr uint32_t UMMA_K = 32 / sizeof(cutlass::float_e4m3_t);
+        // auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<cutlass::float_e4m3_t, cutlass::float_e4m3_t,
+        //                                                            float, cutlass::float_ue8m0_t,
+        //                                                            UMMA_M, UMMA_N, kMajorA, kMajorB>();
+        // auto sf_desc = make_sf_desc(nullptr);
 
-        // ========== 创建UMMA描述符 ==========
-        DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-        auto a_desc = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
-        uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
-        uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
+        // // ========== 创建UMMA描述符 ==========
+        // DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
+        // auto a_desc = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
+        // auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        // uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
+        // uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
-        // ========== MMA指令检查 ==========
-        // 注意：CUTLASS除了MMA特征外没有这样的检查，但我们不使用这些特征
-        DG_STATIC_ASSERT((UMMA_M == 64  and UMMA_N %  8 == 0 and  8 <= UMMA_N and UMMA_N <= 256) or
-                         (UMMA_M == 128 and UMMA_N % 16 == 0 and 16 <= UMMA_N and UMMA_N <= 256) or
-                         (UMMA_M == 256 and UMMA_N % 16 == 0 and 16 <= UMMA_N and UMMA_N <= 256),
-                         "Invalid MMA instruction shape");
+        // // ========== MMA指令检查 ==========
+        // // 注意：CUTLASS除了MMA特征外没有这样的检查，但我们不使用这些特征
+        // DG_STATIC_ASSERT((UMMA_M == 64  and UMMA_N %  8 == 0 and  8 <= UMMA_N and UMMA_N <= 256) or
+        //                  (UMMA_M == 128 and UMMA_N % 16 == 0 and 16 <= UMMA_N and UMMA_N <= 256) or
+        //                  (UMMA_M == 256 and UMMA_N % 16 == 0 and 16 <= UMMA_N and UMMA_N <= 256),
+        //                  "Invalid MMA instruction shape");
 
         // ========== 持续调度处理块 ==========
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -375,12 +375,12 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // 等待TMA和SF转置到达
                         with_sf_full_barriers[s]->wait(phase);
-                        tcgen05_after_thread_sync();
+                        // tcgen05_after_thread_sync();
 
                         // ========== 在特定阶段执行SF复制 ==========
                         // 注意：CUTLASS UTCCP的接口没有 elect_one_sync，我们必须自己处理
-                        const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
-                        if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
+                        // const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
+                        // if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
                             // using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
                             //     cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
 
@@ -398,7 +398,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             //     replace_smem_desc_addr(sf_desc, smem_ptr);
                             //     cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                             // }
-                        }
+                        // }
                         __syncwarp();
 
                         // ========== 在领导CTA中发起UMMA ==========
@@ -445,21 +445,21 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // ========== UTCCP转置器warp ==========
         
         // UTCCP所需的共享内存warp转置函数
-        auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
-            DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
-            uint32_t values[4];
+        // auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
+        //     DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
+        //     uint32_t values[4];
             
-            // 读取数据
-            #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
-                values[i] = ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
-            __syncwarp();
+        //     // 读取数据
+        //     #pragma unroll
+        //     for (uint32_t i = 0; i < 4; ++ i)
+        //         values[i] = ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+        //     __syncwarp();
             
-            // 写回转置后的数据
-            #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
-                st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
-        };
+        //     // 写回转置后的数据
+        //     #pragma unroll
+        //     for (uint32_t i = 0; i < 4; ++ i)
+        //         st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+        // };
 
         // ========== 持续调度处理块 ==========
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -473,18 +473,18 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     full_barriers[s]->wait(phase);
 
                     // 在特定阶段为UTCCP执行转置
-                    const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
-                    if (sf_stage_in_group_idx == 0) {
-                        // 对SFA和SFB执行转置
-                        #pragma unroll
-                        for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
-                            utccp_required_smem_warp_transpose(smem_sfa[s] + i * kNumUTCCPAlignedElems);
-                        #pragma unroll
-                        for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
-                            utccp_required_smem_warp_transpose(smem_sfb[s] + i * kNumUTCCPAlignedElems);
-                        // TODO: 确定代理栅栏对2-CTA情况是否有效
-                        cutlass::arch::fence_view_async_shared();
-                    }
+                    // const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
+                    // if (sf_stage_in_group_idx == 0) {
+                    //     // 对SFA和SFB执行转置
+                    //     #pragma unroll
+                    //     for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
+                    //         utccp_required_smem_warp_transpose(smem_sfa[s] + i * kNumUTCCPAlignedElems);
+                    //     #pragma unroll
+                    //     for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
+                    //         utccp_required_smem_warp_transpose(smem_sfb[s] + i * kNumUTCCPAlignedElems);
+                    //     // TODO: 确定代理栅栏对2-CTA情况是否有效
+                    //     cutlass::arch::fence_view_async_shared();
+                    // }
 
                     // 到达屏障
                     with_sf_full_barriers[s]->arrive(0u);
