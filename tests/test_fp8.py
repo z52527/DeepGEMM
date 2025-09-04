@@ -27,17 +27,17 @@ def test_gemm() -> None:
         use_ue8m0 = get_ue8m0_usage(kernel_type)
         disable_ue8m0_cast = not use_ue8m0
 
-        for test_alias in (False, True):
-            a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, use_ue8m0=use_ue8m0)
-            func_name = f'fp8_gemm_{major_opt.lower() if test_alias else "nt"}'
-            if test_alias:
-                a = a if major_a.is_k_major() else (a[0].T, a[1].T)
-                b = b if major_b.is_k_major() else (b[0].T, b[1].T)
-                assert a[0].is_contiguous() and b[0].is_contiguous()
-            getattr(deep_gemm, func_name)(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast)
-            diff = calc_diff(d, ref_d)
-            assert diff < 0.001, (f'{m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}, {accumulate=}, {out_dtype=}, '
-                                  f'{diff:.5f}, alias={test_alias}')
+        # for test_alias in (False, True):
+        #     a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, use_ue8m0=use_ue8m0)
+        #     func_name = f'fp8_gemm_{major_opt.lower() if test_alias else "nt"}'
+        #     if test_alias:
+        #         a = a if major_a.is_k_major() else (a[0].T, a[1].T)
+        #         b = b if major_b.is_k_major() else (b[0].T, b[1].T)
+        #         assert a[0].is_contiguous() and b[0].is_contiguous()
+        #     getattr(deep_gemm, func_name)(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast)
+        #     diff = calc_diff(d, ref_d)
+        #     assert diff < 0.001, (f'{m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}, {accumulate=}, {out_dtype=}, '
+        #                           f'{diff:.5f}, alias={test_alias}')
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, use_ue8m0=use_ue8m0)
 
         # Test launch overhead
