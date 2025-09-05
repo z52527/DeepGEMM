@@ -564,41 +564,41 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             //  - 原始：(LAYOUT_AD_M, kSwizzleCDMode / kNumBankGroupBytes)
                             //  - 新：(LAYOUT_AD_M * kSwizzleCDMode / kNumBankGroupBytes / 8, 8)
                             // 注意："8"是bank group的数量，"16"是交织模式
-                            constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
-                            auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
-                            auto col = kHasShortcut ? (i) : (bank_group_index % 8);
-                            col ^= row % (kSwizzleCDMode / 16);
+                            // constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
+                            // auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
+                            // auto col = kHasShortcut ? (i) : (bank_group_index % 8);
+                            // col ^= row % (kSwizzleCDMode / 16);
 
-                            // 源和目标内存地址
-                            uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N +               // 累加器偏移
-                                                 w * BLOCK_N +                                          // Wave偏移
-                                                 s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // 块内偏移
-                            auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +        // 基指针
-                                            epilogue_warp_idx * 32 * kSwizzleCDMode +                   // Warp偏移
-                                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // 原子内偏移
+                            // // 源和目标内存地址
+                            // uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N +               // 累加器偏移
+                            //                      w * BLOCK_N +                                          // Wave偏移
+                            //                      s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // 块内偏移
+                            // auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +        // 基指针
+                            //                 epilogue_warp_idx * 32 * kSwizzleCDMode +                   // Warp偏移
+                            //                 row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // 原子内偏移
 
                             // ========== 从张量内存加载，存储到共享内存 ==========
-                            uint32_t values[kNumElemsPerBankGroup];
-                            if constexpr (cute::is_same_v<cd_dtype_t, float>) {
-                                // 对于FP32输出，读取并存储
-                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
-                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
-                                    values[0], values[1], values[2], values[3]);
-                                cutlass::arch::fence_view_async_tmem_load();
-                                st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
-                            } else {
-                                // 对于BF16输出，读取、转换并存储
-                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
-                                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
-                                    values[0], values[1], values[2], values[3],
-                                    values[4], values[5], values[6], values[7]);
-                                cutlass::arch::fence_view_async_tmem_load();
-                                st_shared(smem_ptr,
-                                          cast_into_bf16_and_pack(values[0], values[1]),
-                                          cast_into_bf16_and_pack(values[2], values[3]),
-                                          cast_into_bf16_and_pack(values[4], values[5]),
-                                          cast_into_bf16_and_pack(values[6], values[7]));
-                            }
+                            // uint32_t values[kNumElemsPerBankGroup];
+                            // if constexpr (cute::is_same_v<cd_dtype_t, float>) {
+                            //     // 对于FP32输出，读取并存储
+                            //     DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
+                            //     cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
+                            //         values[0], values[1], values[2], values[3]);
+                            //     cutlass::arch::fence_view_async_tmem_load();
+                            //     st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                            // } else {
+                            //     // 对于BF16输出，读取、转换并存储
+                            //     DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
+                            //     cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
+                            //         values[0], values[1], values[2], values[3],
+                            //         values[4], values[5], values[6], values[7]);
+                            //     cutlass::arch::fence_view_async_tmem_load();
+                            //     st_shared(smem_ptr,
+                            //               cast_into_bf16_and_pack(values[0], values[1]),
+                            //               cast_into_bf16_and_pack(values[2], values[3]),
+                            //               cast_into_bf16_and_pack(values[4], values[5]),
+                            //               cast_into_bf16_and_pack(values[6], values[7]));
+                            // }
                         }
 
                         // ========== 尽快通知张量内存空（仅在领导CTA）到达 ==========
