@@ -194,7 +194,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // 使初始化的屏障在异步代理中可见
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::fence_barrier_init();
-    } else if (threadIdx.x >= 32 and threadIdx.x < 64) {
+    } 
+    else if (threadIdx.x >= 32 and threadIdx.x < 64) {
         // 分配张量内存
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
@@ -346,7 +347,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
                 // 等待张量内存空屏障到达
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
-                tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+                // tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
                 tcgen05_after_thread_sync();
 
                 // ========== 空屏障到达处理 ==========
@@ -362,8 +363,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[s]));
 
                     // 注意：张量内存累加器流水线与多播无关
-                    if (do_tmem_full_arrive)
-                        umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
+                    // if (do_tmem_full_arrive)
+                    //     umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
                 };
 
                 // ========== 启动MMA ==========
@@ -527,7 +528,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
 
                 // 等待UMMA到达
-                tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+                // tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
                 tcgen05_after_thread_sync();
 
                 // ========== 从张量内存加载到寄存器，并用STSM写入共享内存 ==========
@@ -603,11 +604,11 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                         // ========== 尽快通知张量内存空（仅在领导CTA）到达 ==========
                         // 注意：只有最后一个阶段需要这样做
-                        if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
-                            tcgen05_before_thread_sync();
-                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                        }
-                        __syncwarp();
+                        // if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
+                        //     tcgen05_before_thread_sync();
+                        //     tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        // }
+                        // __syncwarp();
 
                         // ========== 同步所有线程并发起TMA ==========
                         cute::tma_store_fence();
