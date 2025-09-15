@@ -15,6 +15,24 @@ from generators import (
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
 )
 
+def generate_random_fp4_as_int32(m, n, device='cuda'):
+    """
+    generate a m×(n/8) int32 matrix, which represents the FP4 data of m×n (Not E2M1, only 4-bit random values)
+    each int32 value packs 8 FP4 values
+    """
+    assert n % 8 == 0, "n must be divisible by 8"
+    
+    # generate random FP4 values (0-15, 4-bit range)
+    fp4_values = torch.randint(0, 16, (m, n), dtype=torch.uint8, device=device)
+    
+    # pack 8 FP4 values into one int32
+    packed_n = n // 8
+    packed_matrix = torch.zeros(m, packed_n, dtype=torch.int32, device=device)
+    
+    for i in range(8):
+        packed_matrix += (fp4_values[:, i::8].to(torch.int32) << (i * 4))
+    
+    return packed_matrix
 
 def test_gemm() -> None:
     print('Testing GEMM:')
@@ -40,6 +58,14 @@ def test_gemm() -> None:
         #                           f'{diff:.5f}, alias={test_alias}')
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, use_ue8m0=use_ue8m0)
 
+        # 先不移除原来的fp8数据和量化部分，仅替换a和b的矩阵类型。
+        # m*n -> m*(n/8)
+        a = (generate_random_fp4_as_int32(m, k), a[1])  # a (m, k) -> (m, k/8)
+        b = (generate_random_fp4_as_int32(n, k), b[1])  # b (n, k) -> (n, k/8)
+
+        print(a[0].shape, b[0].shape)
+        print(f"sf_a={a[1].shape}, sf_b={b[1].shape}")
+        print(f"M={m}, N={n}, K={k}")
         # Test launch overhead
         launch_start_t = time.time_ns()
         deep_gemm.fp8_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast)

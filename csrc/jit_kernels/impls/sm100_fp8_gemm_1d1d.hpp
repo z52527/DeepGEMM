@@ -88,6 +88,10 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
+    std::cout << "Using config: block_m=" << config.block_m 
+            << ", block_n=" << config.block_n 
+            << ", block_k=" << config.block_k 
+            << ", num_stages=" << config.num_stages << std::endl;
     const auto& cd = c.value_or(d);
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),

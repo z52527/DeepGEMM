@@ -32,10 +32,12 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto& [m , k ] = get_shape<2>(a.first);
     const auto& [n , k_] = get_shape<2>(b.first);
     const auto& [m_, n_] = get_shape<2>(d);
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    // Temporarily disable shape checks for FP4 testing (k != k_ due to packing)
+    // DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(m == m_ and n == n_);  // Only check M and N dimensions
     DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    // DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    // DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     // Check C as well
@@ -56,16 +58,17 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), std::nullopt, false, disable_ue8m0_cast);
 
     // Dispatch into different implements
-    const auto& arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
-        sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kFloat) {
-        sm100_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
-    } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
-    }
+    // const auto& arch_major = device_runtime->get_arch_major();
+    // if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+    //     sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+    // } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+    //     sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+    // } else if (arch_major == 10 and sfa.scalar_type() == torch::kFloat) {
+    //     sm100_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+    // } else {
+    //     DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+    // }
+    sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
 }
 
 static void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
