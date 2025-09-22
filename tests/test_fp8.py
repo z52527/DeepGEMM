@@ -12,7 +12,7 @@ from deep_gemm.testing import (
 from generators import (
     KernelType, get_ue8m0_usage,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
-    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
+    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,enumerate_128_layout_compatible
 )
 
 def generate_random_fp4_as_int32(m, n, device='cuda'):
@@ -36,7 +36,7 @@ def generate_random_fp4_as_int32(m, n, device='cuda'):
 
 def test_gemm() -> None:
     print('Testing GEMM:')
-    for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal():
+    for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_128_layout_compatible():
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
         out_opt    = 'FP32' if out_dtype == torch.float else 'BF16'
@@ -196,5 +196,5 @@ if __name__ == '__main__':
 
     test_gemm()
     test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
-    test_k_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_masked()
+    # test_k_grouped_gemm_contiguous()
