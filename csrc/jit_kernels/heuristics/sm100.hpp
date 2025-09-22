@@ -36,6 +36,7 @@ struct SM100ArchSpec {
         switch (ab_dtype) {
             case torch::kBFloat16: return {0, 0};
             case torch::kFloat8_e4m3fn: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case torch::kInt: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};  // FP4 packed data
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }

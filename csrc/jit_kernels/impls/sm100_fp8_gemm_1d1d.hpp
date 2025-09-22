@@ -82,16 +82,25 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                 const std::string& compiled_dims) {
     const auto& aligned_k = align(k, 128);
+    
+    // 检测数据类型：如果是int32，说明是FP4打包数据
+    const bool is_fp4_packed = (a.scalar_type() == torch::kInt);
+    const auto actual_ab_dtype = is_fp4_packed ? torch::kInt : torch::kFloat8_e4m3fn;
+    
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::Normal, KernelType::Kernel1D1D,
         m, n, k, 1, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
+        actual_ab_dtype, d.scalar_type(), c.has_value(),  // 使用实际的数据类型
         device_runtime->get_num_sms());
 
     std::cout << "Using config: block_m=" << config.block_m 
             << ", block_n=" << config.block_n 
             << ", block_k=" << config.block_k 
-            << ", num_stages=" << config.num_stages << std::endl;
+            << ", num_stages=" << config.num_stages;
+    if (is_fp4_packed) {
+        std::cout << " (FP4 packed mode)";
+    }
+    std::cout << std::endl;
     const auto& cd = c.value_or(d);
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),

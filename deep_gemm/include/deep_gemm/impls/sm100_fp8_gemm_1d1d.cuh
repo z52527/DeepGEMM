@@ -57,7 +57,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t kNumUTCCPAlignedElems = 128;                                   // UTCCP对齐的元素数量
     
     // 静态断言验证配置的合法性
-    DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
+    // DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_M % LAYOUT_AD_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
 
     // ========== 动态形状处理 ==========
@@ -93,10 +93,22 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;    // C/D矩阵总共享内存大小
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段A矩阵的共享内存大小
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段B矩阵的共享内存大小
+    
+    // 物理存储：int32打包数据（TMA实际传输的大小）
+    constexpr uint32_t SMEM_A_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t); // 每个阶段A矩阵打包数据大小
+    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t); // 每个阶段B矩阵打包数据大小
+    
+    // 逻辑大小：解包后的单个FP4数据（用于计算访问）
+    constexpr uint32_t SMEM_A_FP4_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * 8 * sizeof(cutlass::float_e2m1_t); // 每个阶段A矩阵FP4大小（8个FP4每个int32）
+    constexpr uint32_t SMEM_B_FP4_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * 8 * sizeof(cutlass::float_e2m1_t); // 每个阶段B矩阵FP4大小（8个FP4每个int32）
+    
     constexpr uint32_t SF_BLOCK_M = constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);  // 对齐后的缩放因子块M大小
     constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);  // 对齐后的缩放因子块N大小
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);       // 每个阶段SFA的共享内存大小
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);       // 每个阶段SFB的共享内存大小
+    
+    // 验证：不需要FP4打包验证，因为BLOCK_K已经是int32单位
+    // DG_STATIC_ASSERT(BLOCK_K % 8 == 0, "BLOCK_K must be divisible by 8 for FP4 packing");
     
     // 验证共享内存对齐要求
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
@@ -132,21 +144,34 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // ========== 共享内存指针设置 ==========
     // 共享内存上的数据（按以下顺序布局）
     cd_dtype_t* smem_cd[kNumTMAStoreStages];                                          // C/D矩阵共享内存指针数组
-    cutlass::float_e4m3_t* smem_a[kNumStages];                                       // A矩阵共享内存指针数组
-    cutlass::float_e4m3_t* smem_b[kNumStages];                                       // B矩阵共享内存指针数组
+    // cutlass::float_e4m3_t* smem_a[kNumStages];                                       // A矩阵共享内存指针数组
+    // cutlass::float_e4m3_t* smem_b[kNumStages];                                       // B矩阵共享内存指针数组
     uint32_t* smem_sfa[kNumStages];                                                   // SFA缩放因子共享内存指针数组
     uint32_t* smem_sfb[kNumStages];                                                   // SFB缩放因子共享内存指针数组
 
+    uint32_t* smem_a_packed[kNumStages];      // 打包后的A矩阵共享内存指针数组
+    uint32_t* smem_b_packed[kNumStages];      // 打包后的B矩阵共享内存指针数组
+    cutlass::float_e2m1_t* smem_a_fp4[kNumStages];                                   // A矩阵单个FP4数据指针（计算用）
+    cutlass::float_e2m1_t* smem_b_fp4[kNumStages];                                   // B矩阵单个FP4数据指针（计算用）
+     
     // 填充D/A/B指针
     #pragma unroll
     for (uint32_t i = 0; i < kNumTMAStoreStages; ++ i)
         smem_cd[i] = reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
+    // #pragma unroll
+    // for (uint32_t i = 0; i < kNumStages; ++ i) {
+    //     smem_a[i] = reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+    //     smem_b[i] = reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+    // }
     #pragma unroll
     for (uint32_t i = 0; i < kNumStages; ++ i) {
-        smem_a[i] = reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
-        smem_b[i] = reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+        smem_a_packed[i] = reinterpret_cast<uint32_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_PACKED_SIZE_PER_STAGE);
+        smem_b_packed[i] = reinterpret_cast<uint32_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_PACKED_SIZE_PER_STAGE + i * SMEM_B_PACKED_SIZE_PER_STAGE);
+        
+        // 重新解释为NVFP4向量（原地转换）
+        smem_a_fp4[i] = reinterpret_cast<cutlass::float_e2m1_t*>(smem_a_packed[i]);
+        smem_b_fp4[i] = reinterpret_cast<cutlass::float_e2m1_t*>(smem_b_packed[i]);
     }
-
     // 填充SFA/SFB指针
     auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
     #pragma unroll
@@ -277,17 +302,17 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                     // ========== 发起TMA传输 ==========
                     if (cute::elect_one_sync()) {
-                        // 根据矩阵布局发起相应的TMA复制
+                        // 根据矩阵布局发起相应的TMA复制（BLOCK_K已经是int32单位，不需要除以8）
                         if constexpr (kMajorA == cute::UMMA::Major::K)
-                            tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a[s], k_a_idx, m_idx);
+                            tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], k_a_idx, m_idx);
                         if constexpr (kMajorA == cute::UMMA::Major::MN)
-                            tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a[s], m_idx, k_a_idx);
+                            tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], m_idx, k_a_idx);
                         if constexpr (kMajorB == cute::UMMA::Major::K)
-                            tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b[s], k_b_idx, n_idx);
+                            tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b_packed[s], k_b_idx, n_idx);
                         if constexpr (kMajorB == cute::UMMA::Major::MN)
-                            tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b[s], n_idx, k_b_idx);
+                            tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b_packed[s], n_idx, k_b_idx);
                     }
-                    auto num_arrival_bytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
+                    auto num_arrival_bytes = SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE;
 
                     // ========== 在特定阶段发起SFA和SFB TMA ==========
                     // 无交织，所以一个TMA对应一个SF就足够了

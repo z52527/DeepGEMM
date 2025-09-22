@@ -147,7 +147,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
                                   const bool& with_accumulation, const int& num_sms) {
-    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
+    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16 or ab_dtype == torch::kInt);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
