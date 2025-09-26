@@ -2,6 +2,10 @@ import copy
 import random
 import time
 import torch
+import os
+
+# 设置CUDA同步模式，确保能看到kernel的printf输出
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 import deep_gemm
 from deep_gemm.testing import (
@@ -12,7 +16,7 @@ from deep_gemm.testing import (
 from generators import (
     KernelType, get_ue8m0_usage,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
-    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,enumerate_128_layout_compatible
+    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,enumerate_128_layout_compatible, enumerate_128_layout_compatible_debug
 )
 
 def generate_random_fp4_as_int32(m, n, device='cuda'):
@@ -36,7 +40,7 @@ def generate_random_fp4_as_int32(m, n, device='cuda'):
 
 def test_gemm() -> None:
     print('Testing GEMM:')
-    for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_128_layout_compatible():
+    for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_128_layout_compatible_debug():
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
         out_opt    = 'FP32' if out_dtype == torch.float else 'BF16'
@@ -66,6 +70,30 @@ def test_gemm() -> None:
         print(a[0].shape, b[0].shape)
         print(f"sf_a={a[1].shape}, sf_b={b[1].shape}")
         print(f"M={m}, N={n}, K={k}")
+        
+        # ========== 调试输出：A矩阵左上角4x4 ==========
+        print("HOST_DEBUG: A Matrix debug start")
+        print(f"HOST_DEBUG: A tensor shape: {a[0].shape}, dtype: {a[0].dtype}")
+        print(f"HOST_DEBUG: Logical K: {k}, Physical K: {a[0].shape[1]} (packed)")
+        
+        # 只输出前4个int32元素，与kernel端保持一致
+        print("HOST_DEBUG: First 4 int32 elements:")
+        linear_idx = 0
+        for row in range(a[0].shape[0]):
+            for col in range(a[0].shape[1]):
+                if linear_idx < 4:
+                    packed_val = a[0][row, col].item()
+                    unsigned_val = packed_val & 0xFFFFFFFF
+                    print(f"HOST_DEBUG: [{linear_idx}] = 0x{unsigned_val:08x}")
+                    linear_idx += 1
+                else:
+                    break
+            if linear_idx >= 4:
+                break
+        
+        print("HOST_DEBUG: A Matrix debug end")
+        print()
+
         # Test launch overhead
         launch_start_t = time.time_ns()
         deep_gemm.fp8_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast)
@@ -195,6 +223,6 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_gemm()
-    test_m_grouped_gemm_contiguous()
+    # test_m_grouped_gemm_contiguous()
     # test_m_grouped_gemm_masked()
     # test_k_grouped_gemm_contiguous()

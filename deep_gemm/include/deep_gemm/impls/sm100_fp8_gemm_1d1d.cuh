@@ -91,8 +91,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // ========== 共享内存大小计算 ==========
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;       // 每个阶段C/D矩阵的共享内存大小
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;    // C/D矩阵总共享内存大小
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段A矩阵的共享内存大小
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段B矩阵的共享内存大小
+    // constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段A矩阵的共享内存大小
+    // constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段B矩阵的共享内存大小
     
     // 物理存储：int32打包数据（TMA实际传输的大小）
     constexpr uint32_t SMEM_A_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t); // 每个阶段A矩阵打包数据大小
@@ -173,7 +173,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         smem_b_fp4[i] = reinterpret_cast<cutlass::float_e2m1_t*>(smem_b_packed[i]);
     }
     // 填充SFA/SFB指针
-    auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    // auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE);
     #pragma unroll
     for (uint32_t i = 0; i < kNumStages; ++ i) {
         smem_sfa[i] = reinterpret_cast<uint32_t*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
@@ -184,7 +185,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // 填充屏障对象
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer +
         SMEM_CD_SIZE +
-        kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
+        // kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
+        kNumStages * (SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE) +
         kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
     auto full_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto empty_barriers             = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
@@ -402,6 +404,19 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         // 等待TMA和SF转置到达
                         with_sf_full_barriers[s]->wait(phase);
                         // tcgen05_after_thread_sync();
+
+                        // ========== FP4调试输出：A矩阵左上角4x4 ==========
+                        if (threadIdx.x == 32 && k_iter == 0 && s == 0 && m_block_idx == 0) {
+                            // 准备前4个int32值
+                            uint32_t val0 = (0 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][0] : 0;
+                            uint32_t val1 = (1 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][1] : 0;
+                            uint32_t val2 = (2 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][2] : 0;
+                            uint32_t val3 = (3 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][3] : 0;
+                            
+                            // 一个printf输出所有内容
+                            printf("KERNEL_DEBUG: m_block=%u BLOCK_K=%u LOAD_BLOCK_M=%u total_elems=%u first_4_int32: [0]=0x%08x [1]=0x%08x [2]=0x%08x [3]=0x%08x\\n", 
+                                   m_block_idx, BLOCK_K, LOAD_BLOCK_M, LOAD_BLOCK_M * BLOCK_K, val0, val1, val2, val3);
+                        }
 
                         // ========== 在特定阶段执行SF复制 ==========
                         // 注意：CUTLASS UTCCP的接口没有 elect_one_sync，我们必须自己处理
