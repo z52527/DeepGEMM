@@ -36,7 +36,35 @@ def generate_random_fp4_as_int32(m, n, device='cuda'):
     for i in range(8):
         packed_matrix += (fp4_values[:, i::8].to(torch.int32) << (i * 4))
     
-    return packed_matrix
+    return packed_matrix, fp4_values
+
+def simple_data_verification_host(a_packed, b_packed, m, n, k_packed):
+    """简单的数据验证：计算每个位置的和与异或，避免溢出"""
+    # 方法1：计算每个矩阵元素的和（模运算避免溢出）
+    sum_result = torch.zeros(m, n, dtype=torch.int64)
+    
+    # 方法2：计算每个矩阵元素的异或（不会溢出）
+    xor_result = torch.zeros(m, n, dtype=torch.int32)
+    
+    for i in range(m):
+        for j in range(n):
+            sum_val = 0
+            xor_val = 0
+            
+            for k in range(k_packed):
+                a_val = a_packed[i, k].item()
+                b_val = b_packed[j, k].item()
+                
+                # 计算和（模2^32避免溢出）
+                sum_val = (sum_val + a_val + b_val) % (2**32)
+                
+                # 计算异或
+                xor_val ^= (a_val ^ b_val)
+            
+            sum_result[i, j] = sum_val
+            xor_result[i, j] = xor_val
+    
+    return sum_result, xor_result
 
 def test_gemm() -> None:
     print('Testing GEMM:')
@@ -64,12 +92,31 @@ def test_gemm() -> None:
 
         # 先不移除原来的fp8数据和量化部分，仅替换a和b的矩阵类型。
         # m*n -> m*(n/8)
-        a = (generate_random_fp4_as_int32(m, k), a[1])  # a (m, k) -> (m, k/8)
-        b = (generate_random_fp4_as_int32(n, k), b[1])  # b (n, k) -> (n, k/8)
+        a_packed, a_fp4_raw = generate_random_fp4_as_int32(m, k)  # a (m, k) -> (m, k/8)
+        b_packed, b_fp4_raw = generate_random_fp4_as_int32(n, k)  # b (n, k) -> (n, k/8)
+        a = (a_packed, a[1])
+        b = (b_packed, b[1])
+        
+        # 计算Host端参考结果（简单验证方法避免溢出）
+        k_packed = k // 8  # 打包后的K维度
+        sum_result, xor_result = simple_data_verification_host(a_packed, b_packed, m, n, k_packed)
+        print(f"HOST_DEBUG: Verification results shape: sum={sum_result.shape}, xor={xor_result.shape}")
+        print(f"HOST_DEBUG: First 4x4 elements (SUM method):")
+        for i in range(min(4, m)):
+            for j in range(min(4, n)):
+                print(f"SUM[{i}][{j}] = {sum_result[i, j].item()}")
+        print(f"HOST_DEBUG: First 4x4 elements (XOR method):")
+        for i in range(min(4, m)):
+            for j in range(min(4, n)):
+                # 将int32转换为uint32显示，避免负数显示
+                xor_val = xor_result[i, j].item()
+                if xor_val < 0:
+                    xor_val = xor_val + 2**32  # 转换为对应的uint32值
+                print(f"XOR[{i}][{j}] = {xor_val}")
 
         print(a[0].shape, b[0].shape)
         print(f"sf_a={a[1].shape}, sf_b={b[1].shape}")
-        print(f"M={m}, N={n}, K={k}")
+        print(f"M={m}, N={n}, K={k}, K_packed={k_packed}")
         
         # ========== 调试输出：A矩阵左上角4x4 ==========
         print("HOST_DEBUG: A Matrix debug start")

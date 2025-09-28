@@ -83,9 +83,9 @@ def enumerate_128_layout_compatible(use_bf16: bool = False) -> Generator:
                         for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
                             yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
 def enumerate_128_layout_compatible_debug(use_bf16: bool = False) -> Generator:
-    for kernel_type in get_kernel_types(use_bf16):
-        for m in (4096,):
-            for n, k in [(4096, 7168)]:
+    for kernel_type in (KernelType.Kernel1D1D,):
+        for m in (128,):
+            for n, k in [(128, 128)]:
                 for major_a, major_b in  ((MajorTypeAB.KMajor,  MajorTypeAB.MNMajor), ):
                     for out_dtype in (torch.bfloat16, ):
                         for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):

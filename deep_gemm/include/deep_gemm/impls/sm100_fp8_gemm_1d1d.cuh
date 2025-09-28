@@ -452,6 +452,104 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         // const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, s);
                         // const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, s);
                         
+
+                        // ========== 简单数据验证实现（避免溢出）==========
+                        // 线程分工：MMA warp有32个线程 (threadIdx.x = 32-63)
+                        const uint32_t thread_id = threadIdx.x - 32;  // 0-31
+                        const uint32_t total_threads = 32;
+                        
+                        // 计算输出矩阵的总元素数
+                        const uint32_t total_output_elements = LOAD_BLOCK_M * LOAD_BLOCK_N;
+                        
+                        // 使用共享内存存储中间结果（两种验证方法）
+                        static __shared__ uint32_t shared_sum_accumulator[4096];  // 和验证（模运算）
+                        static __shared__ uint32_t shared_xor_accumulator[4096];  // 异或验证
+                        
+                        // 初始化累加器（只在第一个K迭代的第一个stage）
+                        if (k_iter == 0 && s == 0) {
+                            for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
+                                shared_sum_accumulator[elem_idx] = 0;
+                                shared_xor_accumulator[elem_idx] = 0;
+                            }
+                        }
+                        __syncwarp();
+                        
+                        // 每个线程计算多个输出元素
+                        for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
+                            const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
+                            const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
+                            
+                            uint32_t local_sum = 0;
+                            uint32_t local_xor = 0;
+                            
+                            // K维度循环：计算简单验证值
+                            for (uint32_t k_packed = 0; k_packed < BLOCK_K; ++k_packed) {
+                                uint32_t a_packed, b_packed;
+                                
+                                // 根据矩阵主序获取正确的数据
+                                if constexpr (kMajorA == cute::UMMA::Major::K) {
+                                    // A是K-major: A[m][k] -> smem_a_packed[m * BLOCK_K + k]
+                                    a_packed = smem_a_packed[s][out_m * BLOCK_K + k_packed];
+                                } else {
+                                    // A是MN-major: A[m][k] -> smem_a_packed[k * LOAD_BLOCK_M + m]
+                                    a_packed = smem_a_packed[s][k_packed * LOAD_BLOCK_M + out_m];
+                                }
+                                
+                                if constexpr (kMajorB == cute::UMMA::Major::K) {
+                                    // B是K-major: B[n][k] -> smem_b_packed[n * BLOCK_K + k]
+                                    b_packed = smem_b_packed[s][out_n * BLOCK_K + k_packed];
+                                } else {
+                                    // B是MN-major: B[n][k] -> smem_b_packed[k * LOAD_BLOCK_N + n]
+                                    b_packed = smem_b_packed[s][k_packed * LOAD_BLOCK_N + out_n];
+                                }
+                                
+                                // 计算简单验证值（避免溢出）
+                                local_sum += (a_packed + b_packed);  // 自动模2^32
+                                local_xor ^= (a_packed ^ b_packed);
+                            }
+                            
+                            // 累加到共享内存累加器中
+                            atomicAdd(&shared_sum_accumulator[elem_idx], local_sum);
+                            atomicXor(&shared_xor_accumulator[elem_idx], local_xor);
+                        }
+                        __syncwarp();
+                        
+                        // 在最后一个K stage输出调试信息
+                        if (is_last_iter && s == kNumInnerStages - 1) {
+                            // 调试输出前几个结果
+                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
+                                printf("KERNEL_VERIFICATION: Results for block (0,0):\\n");
+                                for (uint32_t i = 0; i < min(4u, LOAD_BLOCK_M); ++i) {
+                                    for (uint32_t j = 0; j < min(4u, LOAD_BLOCK_N); ++j) {
+                                        uint32_t idx = i * LOAD_BLOCK_N + j;
+                                        printf("SUM[%u][%u] = %u\\n", i, j, shared_sum_accumulator[idx]);
+                                    }
+                                }
+                                for (uint32_t i = 0; i < min(4u, LOAD_BLOCK_M); ++i) {
+                                    for (uint32_t j = 0; j < min(4u, LOAD_BLOCK_N); ++j) {
+                                        uint32_t idx = i * LOAD_BLOCK_N + j;
+                                        printf("XOR[%u][%u] = %u\\n", i, j, shared_xor_accumulator[idx]);
+                                    }
+                                }
+                            }
+                            
+                            // 将结果转换并写入到smem_cd供epilogue使用（可选）
+                            // 这里简化处理，主要目的是验证数据，使用SUM结果写回
+                            const uint32_t tma_stage_idx = 0;
+                            for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
+                                const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
+                                const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
+                                
+                                // 确保不越界，将验证结果转换为float写入
+                                if (out_m < STORE_BLOCK_M && out_n < STORE_BLOCK_N) {
+                                    // 使用SUM验证结果，转换为float
+                                    float temp_val = static_cast<float>(shared_sum_accumulator[elem_idx]);
+                                    smem_cd[tma_stage_idx][out_m * STORE_BLOCK_N + out_n] = 
+                                        static_cast<cd_dtype_t>(temp_val);
+                                }
+                            }
+                        }
+                        
                         // 嵌套循环执行实际的矩阵乘法运算
                         // #pragma unroll
                         // for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
