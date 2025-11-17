@@ -106,12 +106,14 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
                                                config.block_k,
                                                static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
-                                               config.smem_config.swizzle_a_mode);
+                                               0);
+                                            //    config.smem_config.swizzle_a_mode);
     const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
                                                SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
                                                config.block_k,
                                                static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
-                                               config.smem_config.swizzle_b_mode);
+                                               0);
+                                            //    config.smem_config.swizzle_b_mode);
     const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),

@@ -221,12 +221,12 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     bool order[2] = {false, true};
     if (best_block_m > best_block_n)
         std::swap(order[0], order[1]);
-    for (const bool& is_multicast_on_a: order) {
-        if (m >= 512 and is_legal[static_cast<int>(is_multicast_on_a)]) {
-            best_multicast_config = {2, is_multicast_on_a};
-            break;
-        }
-    }
+    // for (const bool& is_multicast_on_a: order) {
+    //     if (m >= 512 and is_legal[static_cast<int>(is_multicast_on_a)]) {
+    //         best_multicast_config = {2, is_multicast_on_a};
+    //         break;
+    //     }
+    // }
 
     // Always pick the largest number of stage
     constexpr int smem_capacity = ArchSpec::smem_capacity;

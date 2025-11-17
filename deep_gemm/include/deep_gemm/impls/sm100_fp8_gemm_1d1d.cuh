@@ -405,17 +405,29 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         with_sf_full_barriers[s]->wait(phase);
                         // tcgen05_after_thread_sync();
 
-                        // ========== FP4调试输出：A矩阵左上角4x4 ==========
-                        if (threadIdx.x == 32 && k_iter == 0 && s == 0 && m_block_idx == 0) {
-                            // 准备前4个int32值
-                            uint32_t val0 = (0 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][0] : 0;
-                            uint32_t val1 = (1 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][1] : 0;
-                            uint32_t val2 = (2 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][2] : 0;
-                            uint32_t val3 = (3 < LOAD_BLOCK_M * BLOCK_K) ? smem_a_packed[s][3] : 0;
+                        // ========== 数据加载调试输出（只输出一次）==========
+                        if (threadIdx.x == 32 && k_iter == 0 && s == 0 && m_block_idx == 0 && n_block_idx == 0) {
+                            // A矩阵的前4个int32值
+                            uint32_t a_val0 = smem_a_packed[s][0];
+                            uint32_t a_val1 = smem_a_packed[s][1];
+                            uint32_t a_val2 = smem_a_packed[s][2];
+                            uint32_t a_val3 = smem_a_packed[s][3];
                             
-                            // 一个printf输出所有内容
-                            printf("KERNEL_DEBUG: m_block=%u BLOCK_K=%u LOAD_BLOCK_M=%u total_elems=%u first_4_int32: [0]=0x%08x [1]=0x%08x [2]=0x%08x [3]=0x%08x\\n", 
-                                   m_block_idx, BLOCK_K, LOAD_BLOCK_M, LOAD_BLOCK_M * BLOCK_K, val0, val1, val2, val3);
+                            // B矩阵的前4个int32值
+                            uint32_t b_val0 = smem_b_packed[s][0];
+                            uint32_t b_val1 = smem_b_packed[s][1];
+                            uint32_t b_val2 = smem_b_packed[s][2];
+                            uint32_t b_val3 = smem_b_packed[s][3];
+                            
+                            printf("KERNEL_DEBUG: A first_4_int32: [0]=0x%08x [1]=0x%08x [2]=0x%08x [3]=0x%08x\n", 
+                                   a_val0, a_val1, a_val2, a_val3);
+                            printf("KERNEL_DEBUG: B first_4_int32: [0]=0x%08x [1]=0x%08x [2]=0x%08x [3]=0x%08x\n", 
+                                   b_val0, b_val1, b_val2, b_val3);
+                                // 打印B[1]的前2个int32（用于C[0][1]计算）
+                            uint32_t b_1_0 = smem_b_packed[s][1 * BLOCK_K + 0];  // B[1][0]
+                            uint32_t b_1_1 = smem_b_packed[s][1 * BLOCK_K + 1];  // B[1][1]
+                            printf("KERNEL_DEBUG: B[1] first 2: [0]=0x%08x [1]=0x%08x\n", b_1_0, b_1_1);
+
                         }
 
                         // ========== 在特定阶段执行SF复制 ==========
@@ -518,36 +530,147 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         if (is_last_iter && s == kNumInnerStages - 1) {
                             // 调试输出前几个结果
                             if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                                printf("KERNEL_VERIFICATION: Results for block (0,0):\\n");
+                                printf("KERNEL_VERIFICATION: Results for block (0,0):\n");
                                 for (uint32_t i = 0; i < min(4u, LOAD_BLOCK_M); ++i) {
                                     for (uint32_t j = 0; j < min(4u, LOAD_BLOCK_N); ++j) {
                                         uint32_t idx = i * LOAD_BLOCK_N + j;
-                                        printf("SUM[%u][%u] = %u\\n", i, j, shared_sum_accumulator[idx]);
+                                        printf("  SUM[%u][%u] = %12u\n", i, j, shared_sum_accumulator[idx]);
                                     }
                                 }
                                 for (uint32_t i = 0; i < min(4u, LOAD_BLOCK_M); ++i) {
                                     for (uint32_t j = 0; j < min(4u, LOAD_BLOCK_N); ++j) {
                                         uint32_t idx = i * LOAD_BLOCK_N + j;
-                                        printf("XOR[%u][%u] = %u\\n", i, j, shared_xor_accumulator[idx]);
+                                        printf("  XOR[%u][%u] = 0x%08x\n", i, j, shared_xor_accumulator[idx]);
                                     }
                                 }
                             }
                             
                             // 将结果转换并写入到smem_cd供epilogue使用（可选）
                             // 这里简化处理，主要目的是验证数据，使用SUM结果写回
+                            // const uint32_t tma_stage_idx = 0;
+                            // for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
+                            //     const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
+                            //     const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
+                                
+                            //     // 确保不越界，将验证结果转换为float写入
+                            //     if (out_m < STORE_BLOCK_M && out_n < STORE_BLOCK_N) {
+                            //         // 使用SUM验证结果，转换为float
+                            //         float temp_val = static_cast<float>(shared_sum_accumulator[elem_idx]);
+                            //         smem_cd[tma_stage_idx][out_m * STORE_BLOCK_N + out_n] = 
+                            //             static_cast<cd_dtype_t>(temp_val);
+                            //     }
+                            // }
+                        }
+                        
+                        // ========== 新增：FP4 GEMM真正的矩阵乘法实现 ==========
+                        // 使用单独的共享内存累加器进行GEMM计算
+                        static __shared__ float shared_gemm_accumulator[4096];  // FP32累加器用于GEMM
+                        
+                        // 初始化GEMM累加器（只在第一个K迭代的第一个stage）
+                        if (k_iter == 0 && s == 0) {
+                            for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
+                                shared_gemm_accumulator[elem_idx] = 0.0f;
+                            }
+                        }
+                        __syncwarp();
+                        
+                        // 计算真正的FP4 GEMM：解包并做矩阵乘法
+                        for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
+                            const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
+                            const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
+                            
+                            float local_acc = 0.0f;
+                            
+                            // 调试标志：是否为C[0][1]
+                            bool debug_elem = (out_m == 0 && out_n == 1 && thread_id == 0 && 
+                                              m_block_idx == 0 && n_block_idx == 0);
+                            
+                            if (debug_elem) {
+                                printf("\n=== KERNEL: Computing C[0][1], showing first 16 FP4 elements ===\n");
+                            }
+                            
+                            // K维度循环：遍历所有打包的K值
+                            for (uint32_t k_packed = 0; k_packed < BLOCK_K; ++k_packed) {
+                                uint32_t a_packed, b_packed;
+                                
+                                // 根据矩阵主序获取正确的数据（与上面SUM/XOR验证相同的逻辑）
+                                if constexpr (kMajorA == cute::UMMA::Major::K) {
+                                    a_packed = smem_a_packed[s][out_m * BLOCK_K + k_packed];
+                                } else {
+                                    a_packed = smem_a_packed[s][k_packed * LOAD_BLOCK_M + out_m];
+                                }
+                                
+                                if constexpr (kMajorB == cute::UMMA::Major::K) {
+                                    b_packed = smem_b_packed[s][out_n * BLOCK_K + k_packed];
+                                } else {
+                                    b_packed = smem_b_packed[s][k_packed * LOAD_BLOCK_N + out_n];
+                                }
+                                
+                                // 调试：打印前2个k_packed的打包值
+                                if (debug_elem && k_packed < 2) {
+                                    printf("k_packed=%u: a_packed=0x%08x, b_packed=0x%08x\n", 
+                                           k_packed, a_packed, b_packed);
+                                }
+                                
+                                // 解包并计算：每个int32包含8个FP4值
+                                #pragma unroll
+                                for (int fp4_idx = 0; fp4_idx < 8; ++fp4_idx) {
+                                    // 提取第fp4_idx个4-bit值（0-15）
+                                    uint32_t a_fp4 = (a_packed >> (fp4_idx * 4)) & 0xF;
+                                    uint32_t b_fp4 = (b_packed >> (fp4_idx * 4)) & 0xF;
+                                    
+                                    // 调试：打印前16个FP4元素的详细计算（前2个k_packed，每个8个FP4）
+                                    if (debug_elem && k_packed < 2) {
+                                        uint32_t global_k_idx = k_packed * 8 + fp4_idx;
+                                        uint32_t product = a_fp4 * b_fp4;
+                                        printf("  k=%2u: a_fp4=%2u, b_fp4=%2u, product=%3u, acc_before=%.1f, acc_after=%.1f\n",
+                                               global_k_idx, a_fp4, b_fp4, product, local_acc, local_acc + (float)product);
+                                    }
+                                    
+                                    // 转换为float并累加（将4-bit值当作整数0-15）
+                                    local_acc += static_cast<float>(a_fp4) * static_cast<float>(b_fp4);
+                                }
+                            }
+                            
+                            if (debug_elem) {
+                                printf("Final accumulated value for C[0][1]: %.2f\n", local_acc);
+                            }
+                            
+                            // 累加到共享内存GEMM累加器中
+                            atomicAdd(&shared_gemm_accumulator[elem_idx], local_acc);
+                        }
+                        __syncwarp();
+                        
+                        // 在最后一个K stage输出GEMM结果并写回
+                        if (is_last_iter && s == kNumInnerStages - 1) {
+                            // 调试输出前4x4的GEMM结果
+                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
+                                printf("\nKERNEL_GEMM: FP4 GEMM Results [first 4x4]:\n");
+                                for (uint32_t i = 0; i < min(4u, LOAD_BLOCK_M); ++i) {
+                                    for (uint32_t j = 0; j < min(4u, LOAD_BLOCK_N); ++j) {
+                                        uint32_t idx = i * LOAD_BLOCK_N + j;
+                                        printf("  GEMM[%u][%u] = %.2f\n", i, j, shared_gemm_accumulator[idx]);
+                                    }
+                                }
+                            }
+                            
+                            // 将GEMM结果写入到smem_cd供epilogue使用
                             const uint32_t tma_stage_idx = 0;
+                            const uint32_t max_write_m = min(LOAD_BLOCK_M, STORE_BLOCK_M);
+                            const uint32_t max_write_n = min(LOAD_BLOCK_N, STORE_BLOCK_N);
+                            
+                            // 写入GEMM结果
                             for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
                                 const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
                                 const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
                                 
-                                // 确保不越界，将验证结果转换为float写入
-                                if (out_m < STORE_BLOCK_M && out_n < STORE_BLOCK_N) {
-                                    // 使用SUM验证结果，转换为float
-                                    float temp_val = static_cast<float>(shared_sum_accumulator[elem_idx]);
-                                    smem_cd[tma_stage_idx][out_m * STORE_BLOCK_N + out_n] = 
-                                        static_cast<cd_dtype_t>(temp_val);
+                                if (out_m < max_write_m && out_n < max_write_n) {
+                                    float result = shared_gemm_accumulator[elem_idx];
+                                    uint32_t smem_idx = out_m * STORE_BLOCK_N + out_n;
+                                    smem_cd[tma_stage_idx][smem_idx] = static_cast<cd_dtype_t>(result);
                                 }
                             }
+                            __syncwarp();
                         }
                         
                         // 嵌套循环执行实际的矩阵乘法运算
