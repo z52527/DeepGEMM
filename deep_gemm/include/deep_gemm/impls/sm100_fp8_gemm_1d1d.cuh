@@ -270,6 +270,13 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // ========== TMA加载warp ==========
         // 持续调度处理块
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            // 调试：打印CTA信息（只在第一次迭代打印）
+            if (lane_idx == 0 && scheduler.current_iter == 0) {
+                printf("CTA Info: blockIdx=%d, m_block=%d, n_block=%d, cluster_rank=%d\n",
+                       blockIdx.x, m_block_idx, n_block_idx,
+                       cute::block_rank_in_cluster());
+            }
+            
             launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                 constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
@@ -659,18 +666,47 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             const uint32_t max_write_m = min(LOAD_BLOCK_M, STORE_BLOCK_M);
                             const uint32_t max_write_n = min(LOAD_BLOCK_N, STORE_BLOCK_N);
                             
-                            // 写入GEMM结果
+                            // 调试输出维度信息
+                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
+                                printf("KERNEL_DIM_INFO: LOAD_BLOCK_M=%u, LOAD_BLOCK_N=%u\n", LOAD_BLOCK_M, LOAD_BLOCK_N);
+                                printf("KERNEL_DIM_INFO: STORE_BLOCK_M=%u, STORE_BLOCK_N=%u\n", STORE_BLOCK_M, STORE_BLOCK_N);
+                                printf("KERNEL_DIM_INFO: BLOCK_M=%u, BLOCK_N=%u, BLOCK_K=%u\n", BLOCK_M, BLOCK_N, BLOCK_K);
+                                printf("KERNEL_DIM_INFO: kNumMWaves=%u, kNumEpilogueStages=%u\n", kNumMWaves, kNumEpilogueStages);
+                                printf("KERNEL_DIM_INFO: kSwizzleCDMode=%u, sizeof(cd_dtype_t)=%u\n", kSwizzleCDMode, (uint32_t)sizeof(cd_dtype_t));
+                                printf("KERNEL_DIM_INFO: accum_stage_idx=%u, accum_phase_idx=%u\n", accum_stage_idx, accum_phase_idx);
+                            }
+                            
+                            // 写入GEMM结果到smem_cd
+                            // smem_cd布局：[STORE_BLOCK_M, STORE_BLOCK_N]，但有swizzle
+                            // Epilogue会分多个wave处理，每个wave处理STORE_BLOCK_M行
+                            // 我们只写入第一个wave的第一个store块
                             for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
                                 const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
                                 const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
                                 
-                                if (out_m < max_write_m && out_n < max_write_n) {
+                                // 只写入STORE_BLOCK范围内的数据（第一个wave的第一个store）
+                                if (out_m < STORE_BLOCK_M && out_n < STORE_BLOCK_N) {
                                     float result = shared_gemm_accumulator[elem_idx];
+                                    // smem_cd布局：行主序，每行STORE_BLOCK_N个元素
                                     uint32_t smem_idx = out_m * STORE_BLOCK_N + out_n;
                                     smem_cd[tma_stage_idx][smem_idx] = static_cast<cd_dtype_t>(result);
                                 }
                             }
                             __syncwarp();
+                            
+                            // 调试：打印写入smem_cd后的前几个值
+                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
+                                printf("KERNEL_SMEM_CD: After write, first 4 values:\n");
+                                for (uint32_t i = 0; i < 4; ++i) {
+                                    float val = static_cast<float>(smem_cd[tma_stage_idx][i]);
+                                    printf("  smem_cd[%u][%u] = %.2f\n", tma_stage_idx, i, val);
+                                }
+                            }
+                            
+                            // 通知Epilogue数据已准备好
+                            if (cute::elect_one_sync()) {
+                                tmem_full_barriers[accum_stage_idx]->arrive();
+                            }
                         }
                         
                         // 嵌套循环执行实际的矩阵乘法运算
@@ -788,9 +824,20 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     cute::tma_store_wait<0>();
                 cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
 
-                // 等待UMMA到达
-                // tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+                // 等待MMA warp完成数据写入到smem_cd
+                tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
                 tcgen05_after_thread_sync();
+                
+                // 调试输出
+                if (epilogue_thread_idx == 0 && m_block_idx == 0 && n_block_idx == 0) {
+                    printf("KERNEL_EPILOGUE: Barrier passed! accum_stage_idx=%u, accum_phase_idx=%u\n", 
+                           accum_stage_idx, accum_phase_idx);
+                    printf("KERNEL_EPILOGUE: smem_cd[0] first 4 values:\n");
+                    for (uint32_t i = 0; i < 4; ++i) {
+                        float val = static_cast<float>(smem_cd[0][i]);
+                        printf("  smem_cd[0][%u] = %.2f\n", i, val);
+                    }
+                }
 
                 // ========== 从张量内存加载到寄存器，并用STSM写入共享内存 ==========
                 DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
@@ -875,6 +922,12 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         cute::tma_store_fence();
                         cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
                         if (epilogue_thread_idx == 0) {
+                            // 调试输出TMA Store参数（只输出第一个块的第一次store）
+                            if (m_block_idx == 0 && n_block_idx == 0 && w == 0 && s == 0) {
+                                printf("KERNEL_TMA_STORE: w=%u, s=%u, tma_stage_idx=%u, m_idx=%u, n_idx=%u\n",
+                                       w, s, tma_stage_idx, m_idx, n_idx);
+                            }
+                            
                             using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                 cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                             cute_tma_t::copy(&tensor_map_d, smem_cd[tma_stage_idx], n_idx, m_idx);

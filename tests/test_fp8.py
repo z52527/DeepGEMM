@@ -289,11 +289,15 @@ def test_gemm_single_tile():
     # ========== Step 1: 限制为单CTA单Tile ==========
     # 固定为一个tile的大小（根据实际的kernel配置）
     # 实际配置：block_k = 128字节 / 4字节(int32) = 32个int32
-    m = 128          # BLOCK_M (输出矩阵C的M维度)
-    n = 16           # BLOCK_N (输出矩阵C的N维度) - 实际配置是16不是256
-    k = 256          # BLOCK_K × 8 = 32 × 8 (实际FP4元素数量)
-    k_packed = 32    # BLOCK_K (int32单位) - 实际配置是32不是128
-    
+    # m = 128          # BLOCK_M (输出矩阵C的M维度)
+    # n = 16           # BLOCK_N (输出矩阵C的N维度) - 实际配置是16不是256
+    # k = 256          # BLOCK_K × 8 = 32 × 8 (实际FP4元素数量)
+    # k_packed = 32    # BLOCK_K (int32单位) - 实际配置是32不是128
+    m = 256          # BLOCK_M (输出矩阵C的M维度)
+    n = 32           # BLOCK_N (输出矩阵C的N维度)  
+    k = 512          # BLOCK_K × 8 = 32 × 8 (实际FP4元素数量)
+    k_packed = 64    # BLOCK_K (int32单位) 
+
     print(f"\n[Step 1] 生成单Tile数据")
     print(f"  矩阵维度: M={m}, N={n}, K={k} (FP4元素)")
     print(f"  打包维度: M={m}, N={n}, K_packed={k_packed} (int32)")
@@ -316,8 +320,10 @@ def test_gemm_single_tile():
     
     # 生成随机FP4数据（打包成int32）
     device = 'cuda'
-    a_packed, a_fp4_raw = generate_random_fp4_as_int32(m, k, device=device)      # [128, 128]
-    b_packed, b_fp4_raw = generate_random_fp4_as_int32(n, k, device=device)      # [256, 128]
+    # A矩阵: [M, K] FP4 → [M, K/8] int32
+    # B矩阵: [N, K] FP4 → [N, K/8] int32（K-major格式）
+    a_packed, a_fp4_raw = generate_random_fp4_as_int32(m, k, device=device)      # [256, 64] int32
+    b_packed, b_fp4_raw = generate_random_fp4_as_int32(n, k, device=device)      # [32, 64] int32
     
     # 替换数据部分，保留scaling factors（与test_gemm一致）
     a = (a_packed, a_orig[1])  # 使用原来的scaling factor
@@ -442,6 +448,74 @@ def test_gemm_single_tile():
     print(f"    平均差异: {mean_diff:.6f}")
     print(f"    最大差异: {max_diff_full:.6f}")
     print(f"    前4x4错误数: {num_errors}/16")
+    
+    # ========== 按CTA区域打印C矩阵 ==========
+    print(f"\n[按CTA区域打印C矩阵 {m}×{n}]")
+    block_m = 128  # 从config获取
+    block_n = 16
+    num_m_blocks = (m + block_m - 1) // block_m
+    num_n_blocks = (n + block_n - 1) // block_n
+    
+    for m_block in range(num_m_blocks):
+        for n_block in range(num_n_blocks):
+            m_start = m_block * block_m
+            m_end = min((m_block + 1) * block_m, m)
+            n_start = n_block * block_n
+            n_end = min((n_block + 1) * block_n, n)
+            
+            cta_idx = m_block * num_n_blocks + n_block
+            print(f"\n=== CTA{cta_idx}: C[{m_start}:{m_end}, {n_start}:{n_end}] (m_block={m_block}, n_block={n_block}) ===")
+            
+            # 提取这个tile
+            tile_gpu = d_cpu[m_start:m_end, n_start:n_end]
+            tile_ref = gemm_ref_unpacked[m_start:m_end, n_start:n_end]
+            tile_diff = torch.abs(tile_gpu - tile_ref)
+            
+            # 统计信息
+            print(f"  GPU: min={tile_gpu.min():.4f}, max={tile_gpu.max():.4f}, mean={tile_gpu.mean():.4f}")
+            print(f"  Ref: min={tile_ref.min():.4f}, max={tile_ref.max():.4f}, mean={tile_ref.mean():.4f}")
+            print(f"  Diff: max={tile_diff.max():.6f}, mean={tile_diff.mean():.6f}")
+            
+            # 打印前4行的所有列（每个tile的N维度不大）
+            print(f"  前4行×全部{n_end-n_start}列:")
+            print(f"    GPU:")
+            for row in range(min(4, tile_gpu.shape[0])):
+                row_str = "    " + " ".join([f"{tile_gpu[row, col]:7.2f}" for col in range(tile_gpu.shape[1])])
+                print(row_str)
+            
+            print(f"    Ref:")
+            for row in range(min(4, tile_ref.shape[0])):
+                row_str = "    " + " ".join([f"{tile_ref[row, col]:7.2f}" for col in range(tile_ref.shape[1])])
+                print(row_str)
+    
+    # ========== 关键位置采样 ==========
+    print(f"\n[关键位置采样验证]")
+    sample_points = [
+        (0, 0, "CTA0左上角"),
+        (0, 15, "CTA0右上角"),
+        (127, 0, "CTA0左下角"),
+        (127, 15, "CTA0右下角"),
+        (0, 16, "CTA1左上角"),
+        (127, 31, "CTA1右下角"),
+        (128, 0, "CTA2左上角"),
+        (255, 15, "CTA2右下角"),
+        (128, 16, "CTA3左上角"),
+        (255, 31, "CTA3右下角"),
+        (127, 15, "四CTA交界A"),
+        (128, 16, "四CTA交界B"),
+    ]
+    
+    print(f"  {'Position':<12} {'Description':<15} {'GPU':<12} {'Ref':<12} {'Diff':<12} {'Status'}")
+    print(f"  {'-'*75}")
+    
+    for i, j, desc in sample_points:
+        if i < m and j < n:
+            gpu_val = d_cpu[i, j].item()
+            ref_val = gemm_ref_unpacked[i, j].item()
+            diff = abs(gpu_val - ref_val)
+            is_ok = diff < 1.0
+            status = "✓" if is_ok else "✗"
+            print(f"  [{i:3d},{j:2d}]   {desc:<15} {gpu_val:10.2f}  {ref_val:10.2f}  {diff:10.6f}  {status}")
     
     # 检查kernel是否有printf输出
     print(f"\n[Kernel Debug Output]")
