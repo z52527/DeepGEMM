@@ -114,16 +114,18 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                                static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
                                                0);
                                             //    config.smem_config.swizzle_b_mode);
+    // FP4测试：暂时禁用swizzle，使用简单的行主序布局
+    const int fp4_test_swizzle_mode = 0;  // 临时禁用swizzle
     const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), 1,
-                                                config.smem_config.swizzle_cd_mode);
+                                                fp4_test_swizzle_mode);  // 使用0代替swizzle_cd_mode
     const auto& tensor_map_c = make_tma_cd_desc(cd, m, n,
                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(cd.stride(-2)), 1,
-                                                config.smem_config.swizzle_cd_mode);
+                                                fp4_test_swizzle_mode);  // 使用0代替swizzle_cd_mode
     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                   config.block_m, config.block_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,

@@ -290,13 +290,18 @@ def test_gemm_single_tile():
     # 固定为一个tile的大小（根据实际的kernel配置）
     # 实际配置：block_k = 128字节 / 4字节(int32) = 32个int32
     # m = 128          # BLOCK_M (输出矩阵C的M维度)
-    # n = 16           # BLOCK_N (输出矩阵C的N维度) - 实际配置是16不是256
-    # k = 256          # BLOCK_K × 8 = 32 × 8 (实际FP4元素数量)
-    # k_packed = 32    # BLOCK_K (int32单位) - 实际配置是32不是128
-    m = 256          # BLOCK_M (输出矩阵C的M维度)
-    n = 32           # BLOCK_N (输出矩阵C的N维度)  
-    k = 512          # BLOCK_K × 8 = 32 × 8 (实际FP4元素数量)
-    k_packed = 64    # BLOCK_K (int32单位) 
+    # ========== 单CTA单块测试配置 ==========
+    # 完全匹配一个CTA块，排除多CTA问题
+    # m = 128          # BLOCK_M (一个CTA块)
+    # n = 16           # BLOCK_N (一个CTA块)
+    # k = 256          # BLOCK_K × 8 = 32 × 8 (一次K迭代)
+    # k_packed = 32    # BLOCK_K (int32单位)
+    
+    # ========== 多CTA测试配置（注释掉）==========
+    m = 256          # 2个CTA块 (M维度)
+    n = 32           # 2个CTA块 (N维度)  
+    k = 512          # 多次K迭代
+    k_packed = 64 
 
     print(f"\n[Step 1] 生成单Tile数据")
     print(f"  矩阵维度: M={m}, N={n}, K={k} (FP4元素)")
@@ -476,34 +481,46 @@ def test_gemm_single_tile():
             print(f"  Ref: min={tile_ref.min():.4f}, max={tile_ref.max():.4f}, mean={tile_ref.mean():.4f}")
             print(f"  Diff: max={tile_diff.max():.6f}, mean={tile_diff.mean():.6f}")
             
-            # 打印前4行的所有列（每个tile的N维度不大）
-            print(f"  前4行×全部{n_end-n_start}列:")
-            print(f"    GPU:")
+            # 打印前4行和最后4行的对比
+            print(f"  前4行×全部{n_end-n_start}列 (GPU vs Ref):")
             for row in range(min(4, tile_gpu.shape[0])):
-                row_str = "    " + " ".join([f"{tile_gpu[row, col]:7.2f}" for col in range(tile_gpu.shape[1])])
-                print(row_str)
+                gpu_str = " ".join([f"{tile_gpu[row, col]:8.1f}" for col in range(tile_gpu.shape[1])])
+                ref_str = " ".join([f"{tile_ref[row, col]:8.1f}" for col in range(tile_ref.shape[1])])
+                match = "✓" if torch.allclose(tile_gpu[row], tile_ref[row], atol=1.0) else "✗"
+                print(f"    [{row:3d}] GPU: {gpu_str} {match}")
+                print(f"          Ref: {ref_str}")
             
-            print(f"    Ref:")
-            for row in range(min(4, tile_ref.shape[0])):
-                row_str = "    " + " ".join([f"{tile_ref[row, col]:7.2f}" for col in range(tile_ref.shape[1])])
-                print(row_str)
+            # 打印最后4行（检查M维度末尾）
+            if tile_gpu.shape[0] > 8:
+                print(f"  后4行×全部{n_end-n_start}列 (GPU vs Ref):")
+                for row in range(max(0, tile_gpu.shape[0]-4), tile_gpu.shape[0]):
+                    gpu_str = " ".join([f"{tile_gpu[row, col]:8.1f}" for col in range(tile_gpu.shape[1])])
+                    ref_str = " ".join([f"{tile_ref[row, col]:8.1f}" for col in range(tile_ref.shape[1])])
+                    match = "✓" if torch.allclose(tile_gpu[row], tile_ref[row], atol=1.0) else "✗"
+                    print(f"    [{row:3d}] GPU: {gpu_str} {match}")
+                    print(f"          Ref: {ref_str}")
     
     # ========== 关键位置采样 ==========
     print(f"\n[关键位置采样验证]")
+    # 根据当前测试维度动态生成采样点
     sample_points = [
-        (0, 0, "CTA0左上角"),
-        (0, 15, "CTA0右上角"),
-        (127, 0, "CTA0左下角"),
-        (127, 15, "CTA0右下角"),
-        (0, 16, "CTA1左上角"),
-        (127, 31, "CTA1右下角"),
-        (128, 0, "CTA2左上角"),
-        (255, 15, "CTA2右下角"),
-        (128, 16, "CTA3左上角"),
-        (255, 31, "CTA3右下角"),
-        (127, 15, "四CTA交界A"),
-        (128, 16, "四CTA交界B"),
+        (0, 0, "左上角"),
+        (0, min(n-1, 15), "右上角"),
+        (min(m-1, 127), 0, "左下角"),
+        (min(m-1, 127), min(n-1, 15), "右下角"),
+        (m//2, n//2, "中心点"),
     ]
+    # 如果有多个CTA，添加更多采样点
+    if m > 128:
+        sample_points.extend([
+            (128, 0, "CTA2左上角"),
+            (min(m-1, 255), min(n-1, 15), "CTA2右下角"),
+        ])
+    if n > 16:
+        sample_points.extend([
+            (0, 16, "CTA1左上角"),
+            (min(m-1, 127), min(n-1, 31), "CTA1右下角"),
+        ])
     
     print(f"  {'Position':<12} {'Description':<15} {'GPU':<12} {'Ref':<12} {'Diff':<12} {'Status'}")
     print(f"  {'-'*75}")
