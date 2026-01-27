@@ -158,7 +158,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
         block_ms = std::vector{64, 128};
     std::vector<int> block_ns;
-    for (int i = 16; i <= 256; i += 16)
+    for (int i = 64; i <= 256; i += 16)
         block_ns.push_back(i);
 
     // K block size is selected in a fixed manner
@@ -257,7 +257,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
     }
-
+    printf("best block n: %d\n", best_block_n);
     const auto& config = GemmConfig {
         .gemm_type = gemm_type,
         .kernel_type = kernel_type,

@@ -299,7 +299,7 @@ def test_gemm_single_tile():
     
     # ========== 多CTA测试配置（注释掉）==========
     m = 256          # 2个CTA块 (M维度)
-    n = 32           # 2个CTA块 (N维度)  
+    n = 256           # 2个CTA块 (N维度)  
     k = 512          # 多次K迭代
     k_packed = 64 
 
@@ -457,7 +457,7 @@ def test_gemm_single_tile():
     # ========== 按CTA区域打印C矩阵 ==========
     print(f"\n[按CTA区域打印C矩阵 {m}×{n}]")
     block_m = 128  # 从config获取
-    block_n = 16
+    block_n = 64
     num_m_blocks = (m + block_m - 1) // block_m
     num_n_blocks = (n + block_n - 1) // block_n
     
@@ -481,24 +481,25 @@ def test_gemm_single_tile():
             print(f"  Ref: min={tile_ref.min():.4f}, max={tile_ref.max():.4f}, mean={tile_ref.mean():.4f}")
             print(f"  Diff: max={tile_diff.max():.6f}, mean={tile_diff.mean():.6f}")
             
+            if tile_diff.max() > 0.001:
             # 打印前4行和最后4行的对比
-            print(f"  前4行×全部{n_end-n_start}列 (GPU vs Ref):")
-            for row in range(min(4, tile_gpu.shape[0])):
-                gpu_str = " ".join([f"{tile_gpu[row, col]:8.1f}" for col in range(tile_gpu.shape[1])])
-                ref_str = " ".join([f"{tile_ref[row, col]:8.1f}" for col in range(tile_ref.shape[1])])
-                match = "✓" if torch.allclose(tile_gpu[row], tile_ref[row], atol=1.0) else "✗"
-                print(f"    [{row:3d}] GPU: {gpu_str} {match}")
-                print(f"          Ref: {ref_str}")
-            
-            # 打印最后4行（检查M维度末尾）
-            if tile_gpu.shape[0] > 8:
-                print(f"  后4行×全部{n_end-n_start}列 (GPU vs Ref):")
-                for row in range(max(0, tile_gpu.shape[0]-4), tile_gpu.shape[0]):
+                print(f"  前4行×全部{n_end-n_start}列 (GPU vs Ref):")
+                for row in range(min(4, tile_gpu.shape[0])):
                     gpu_str = " ".join([f"{tile_gpu[row, col]:8.1f}" for col in range(tile_gpu.shape[1])])
                     ref_str = " ".join([f"{tile_ref[row, col]:8.1f}" for col in range(tile_ref.shape[1])])
                     match = "✓" if torch.allclose(tile_gpu[row], tile_ref[row], atol=1.0) else "✗"
                     print(f"    [{row:3d}] GPU: {gpu_str} {match}")
                     print(f"          Ref: {ref_str}")
+                
+                # 打印最后4行（检查M维度末尾）
+                if tile_gpu.shape[0] > 8:
+                    print(f"  后4行×全部{n_end-n_start}列 (GPU vs Ref):")
+                    for row in range(max(0, tile_gpu.shape[0]-4), tile_gpu.shape[0]):
+                        gpu_str = " ".join([f"{tile_gpu[row, col]:8.1f}" for col in range(tile_gpu.shape[1])])
+                        ref_str = " ".join([f"{tile_ref[row, col]:8.1f}" for col in range(tile_ref.shape[1])])
+                        match = "✓" if torch.allclose(tile_gpu[row], tile_ref[row], atol=1.0) else "✗"
+                        print(f"    [{row:3d}] GPU: {gpu_str} {match}")
+                        print(f"          Ref: {ref_str}")
     
     # ========== 关键位置采样 ==========
     print(f"\n[关键位置采样验证]")
