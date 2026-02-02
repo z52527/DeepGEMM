@@ -38,43 +38,151 @@ def generate_random_fp4_as_int32(m, n, device='cuda'):
     
     return packed_matrix, fp4_values
 
-def simple_data_verification_host(a_packed, b_packed, m, n, k_packed):
-    """简单的数据验证：计算每个位置的和与异或，避免溢出（向量化版本）"""
-    print(f"    使用向量化计算加速...")
+
+def fp4_e2m1_bits_to_float(bits_4bit):
+    """
+    将 4-bit 整数值（0-15）转换为真正的 E2M1 FP4 浮点数值
     
-    # 移到CPU进行计算（避免重复的GPU->CPU传输）
-    a_cpu = a_packed.cpu().to(torch.int64)  # [m, k_packed]
-    b_cpu = b_packed.cpu().to(torch.int64)  # [n, k_packed]
+    E2M1 格式：
+    - 4 bits: SEEM (S=符号 1bit, E=指数 2bits, M=尾数 1bit)
+    - bias = 1
     
-    # 方法1：计算每个矩阵元素的和（使用张量操作）
-    # C[i,j] = sum_k (A[i,k] + B[j,k])
-    # 扩展维度: A[m,1,k] + B[1,n,k] = [m,n,k]
-    a_expanded = a_cpu.unsqueeze(1)  # [m, 1, k_packed]
-    b_expanded = b_cpu.unsqueeze(0)  # [1, n, k_packed]
+    数值计算：
+    - 如果 E == 0 (subnormal): value = (-1)^S * 0.5 * M
+    - 如果 E != 0 (normal):    value = (-1)^S * 2^(E-1) * (1 + M*0.5)
     
-    # 逐元素相加后沿K维度求和
-    sum_result = (a_expanded + b_expanded).sum(dim=2)  # [m, n]
-    sum_result = sum_result % (2**32)  # 模2^32避免溢出
+    所有 16 种可能值的映射表：
+    bits | S | E | M | 数值
+    0000 | 0 | 0 | 0 |  0.0
+    0001 | 0 | 0 | 1 |  0.5
+    0010 | 0 | 1 | 0 |  1.0
+    0011 | 0 | 1 | 1 |  1.5
+    0100 | 0 | 2 | 0 |  2.0
+    0101 | 0 | 2 | 1 |  3.0
+    0110 | 0 | 3 | 0 |  4.0
+    0111 | 0 | 3 | 1 |  6.0
+    1000 | 1 | 0 | 0 | -0.0
+    1001 | 1 | 0 | 1 | -0.5
+    1010 | 1 | 1 | 0 | -1.0
+    1011 | 1 | 1 | 1 | -1.5
+    1100 | 1 | 2 | 0 | -2.0
+    1101 | 1 | 2 | 1 | -3.0
+    1110 | 1 | 3 | 0 | -4.0
+    1111 | 1 | 3 | 1 | -6.0
     
-    # 方法2：计算每个矩阵元素的异或（使用张量操作）
-    # C[i,j] = xor_k (A[i,k] ^ B[j,k])
-    xor_expanded = a_cpu.unsqueeze(1) ^ b_cpu.unsqueeze(0)  # [m, n, k_packed]
+    Args:
+        bits_4bit: int 或 torch.Tensor，4-bit 值（0-15）
     
-    # 沿K维度进行异或归约
-    xor_result = xor_expanded[:, :, 0]
-    for k in range(1, k_packed):
-        xor_result ^= xor_expanded[:, :, k]
+    Returns:
+        对应的 E2M1 FP4 浮点数值
+    """
+    # 查找表：直接映射 4-bit 值到浮点数
+    E2M1_LUT = torch.tensor([
+         0.0,   0.5,   1.0,   1.5,   2.0,   3.0,   4.0,   6.0,  # 正数 (S=0)
+        -0.0,  -0.5,  -1.0,  -1.5,  -2.0,  -3.0,  -4.0,  -6.0   # 负数 (S=1)
+    ], dtype=torch.float32)
     
-    xor_result = xor_result.to(torch.int32)
+    if isinstance(bits_4bit, torch.Tensor):
+        # 确保输入在合法范围内
+        bits_4bit = bits_4bit.long() & 0xF
+        return E2M1_LUT[bits_4bit]
+    else:
+        # 标量情况
+        return E2M1_LUT[int(bits_4bit) & 0xF].item()
+
+
+def fp4_e2m1_gemm_reference(a_packed, b_packed, m, n, k_packed, debug=False):
+    """
+    真正的 E2M1 FP4 GEMM Reference：
+    1. 解包 int32 中的 4-bit 值
+    2. 将 4-bit 值转换为真正的 E2M1 FP4 浮点数
+    3. 进行矩阵乘法
     
-    print(f"    验证计算完成！")
-    return sum_result, xor_result
+    计算 C[m,n] = A[m,k] × B^T[n,k]
+    
+    Args:
+        a_packed: [m, k_packed] int32 tensor, 每个int32包含8个FP4
+        b_packed: [n, k_packed] int32 tensor, 每个int32包含8个FP4
+        m, n: 输出矩阵维度
+        k_packed: K维度（int32单位），实际K = k_packed × 8
+        debug: 是否打印调试信息
+    
+    Returns:
+        c_result: [m, n] float32 tensor
+    """
+    print(f"    [E2M1 FP4 GEMM] 解包 4-bit 值并转换为真正的 E2M1 浮点数...")
+    
+    # 将数据移到 CPU 进行计算
+    a_cpu = a_packed.cpu()
+    b_cpu = b_packed.cpu()
+    
+    # E2M1 查找表
+    E2M1_LUT = torch.tensor([
+         0.0,   0.5,   1.0,   1.5,   2.0,   3.0,   4.0,   6.0,  # 正数 (S=0)
+        -0.0,  -0.5,  -1.0,  -1.5,  -2.0,  -3.0,  -4.0,  -6.0   # 负数 (S=1)
+    ], dtype=torch.float32)
+    
+    def unpack_and_convert_to_e2m1(packed_tensor):
+        """
+        解包 int32 为 8 个 4-bit 值，并转换为 E2M1 浮点数
+        [batch, k_packed] int32 -> [batch, k_packed*8] float32
+        """
+        shape = packed_tensor.shape
+        # 转换为 int64 避免符号问题
+        packed_int64 = packed_tensor.to(torch.int64) & 0xFFFFFFFF
+        
+        # 解包 8 个 FP4 值
+        unpacked_bits = []
+        for i in range(8):
+            fp4_bits = (packed_int64 >> (i * 4)) & 0xF
+            unpacked_bits.append(fp4_bits)
+        
+        # 堆叠成 [batch, k_packed, 8] 然后重塑为 [batch, k_packed*8]
+        unpacked_bits = torch.stack(unpacked_bits, dim=-1)  # [batch, k_packed, 8]
+        unpacked_bits = unpacked_bits.reshape(*shape[:-1], -1)  # [batch, k_packed*8]
+        
+        # 使用查找表转换为 E2M1 浮点数
+        e2m1_values = E2M1_LUT[unpacked_bits.long()]
+        
+        return e2m1_values
+    
+    print(f"      解包并转换 A 矩阵...")
+    a_e2m1 = unpack_and_convert_to_e2m1(a_cpu)  # [m, k_packed*8]
+    print(f"      解包并转换 B 矩阵...")
+    b_e2m1 = unpack_and_convert_to_e2m1(b_cpu)  # [n, k_packed*8]
+    
+    if debug:
+        print(f"\n=== E2M1 FP4 GEMM Debug: C[0][1] 计算详情 ===")
+        print(f"  A[0] (第0行前16个E2M1值): {a_e2m1[0, :16].tolist()}")
+        print(f"  B[1] (第1行前16个E2M1值): {b_e2m1[1, :16].tolist()}")
+        
+        # 详细计算 C[0][1]
+        a_row = a_e2m1[0]  # A 的第 0 行
+        b_row = b_e2m1[1]  # B 的第 1 行
+        
+        print(f"\n  逐元素乘积 (前16个):")
+        for i in range(min(16, a_row.shape[0])):
+            prod = a_row[i] * b_row[i]
+            print(f"    k={i:2d}: A={a_row[i]:6.2f} × B={b_row[i]:6.2f} = {prod:8.2f}")
+        
+        c_01 = (a_row * b_row).sum()
+        print(f"\n  C[0][1] = sum(A[0] * B[1]) = {c_01.item():.4f}")
+    
+    # 矩阵乘法: C = A @ B^T
+    print(f"      执行矩阵乘法...")
+    c_result = torch.matmul(a_e2m1, b_e2m1.T)  # [m, n]
+    
+    print(f"    [E2M1 FP4 GEMM] 计算完成！")
+    print(f"    结果形状: {c_result.shape}")
+    print(f"    结果前 4x4:\n{c_result[:4, :4]}")
+    
+    return c_result
+
 
 
 def simple_fp4_gemm_reference_packed(a_packed, b_packed, m, n, k_packed):
     """
     简化版FP4 GEMM Reference：直接对int32做乘法（不解包FP4，向量化版本）
-    这样可以快速验证数据流是否正确
     
     计算 C[m,n] = A[m,k] × B^T[n,k]
     
@@ -368,9 +476,6 @@ def test_gemm_single_tile():
     # ========== Step 2: 计算Python Reference ==========
     print(f"\n[Step 2] 计算Python端Reference")
     
-    # 方法1：简单验证（和+异或）- 与kernel当前实现对应
-    print(f"  计算简单验证（SUM + XOR）...")
-    sum_result, xor_result = simple_data_verification_host(a_packed, b_packed, m, n, k_packed)
     
     print(f"  简单验证结果（前4x4）:")
     for i in range(min(4, m)):
@@ -457,7 +562,7 @@ def test_gemm_single_tile():
     # ========== 按CTA区域打印C矩阵 ==========
     print(f"\n[按CTA区域打印C矩阵 {m}×{n}]")
     block_m = 128  # 从config获取
-    block_n = 64
+    block_n = 16
     num_m_blocks = (m + block_m - 1) // block_m
     num_n_blocks = (n + block_n - 1) // block_n
     
@@ -549,6 +654,79 @@ def test_gemm_single_tile():
     print(f"="*80)
 
 
+def test_fp4_e2m1_gemm():
+    """
+    简洁测试：对比 kernel 输出与 E2M1 FP4 GEMM reference
+    """
+    print('='*60)
+    print('Test: FP4 E2M1 GEMM vs Kernel')
+    print('='*60)
+    
+    # 配置
+    m, n, k = 256, 256, 512
+    k_packed = k // 8
+    
+    # 数据生成
+    from generators import KernelType, MajorTypeAB
+    kernel_type = KernelType.Kernel1D1D
+    major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
+    use_ue8m0 = get_ue8m0_usage(kernel_type)
+    disable_ue8m0_cast = not use_ue8m0
+    
+    a_orig, b_orig, c, d, _ = generate_normal(m, n, k, major_a, major_b, False, torch.float32, use_ue8m0=use_ue8m0)
+    a_packed, _ = generate_random_fp4_as_int32(m, k, device='cuda')
+    b_packed, _ = generate_random_fp4_as_int32(n, k, device='cuda')
+    
+    a = (a_packed, a_orig[1])
+    b = (b_packed, b_orig[1])
+    
+    print(f"Config: M={m}, N={n}, K={k}, K_packed={k_packed}")
+    
+    # 计算 E2M1 FP4 reference
+    print("\n[1] Computing E2M1 FP4 reference...")
+    ref_e2m1 = fp4_e2m1_gemm_reference(a_packed, b_packed, m, n, k_packed, debug=False)
+    
+    # 调用 kernel
+    print("\n[2] Running kernel...")
+    try:
+        deep_gemm.fp8_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast)
+        torch.cuda.synchronize()
+        print("Kernel completed.")
+    except Exception as e:
+        print(f"Kernel failed: {e}")
+        return
+    
+    # 对比结果
+    print("\n[3] Comparing results...")
+    d_cpu = d.cpu().float()
+    ref_e2m1_cpu = ref_e2m1.cpu().float()
+    
+    diff = torch.abs(d_cpu - ref_e2m1_cpu)
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    
+    print(f"  Max  diff: {max_diff:.4f}")
+    print(f"  Mean diff: {mean_diff:.4f}")
+    
+    # 显示前 4x4 对比
+    print(f"\n  First 4x4 comparison:")
+    print(f"  {'[i,j]':<6} {'Kernel':<12} {'E2M1_Ref':<12} {'Diff':<12}")
+    for i in range(min(4, m)):
+        for j in range(min(4, n)):
+            k_val = d_cpu[i, j].item()
+            r_val = ref_e2m1_cpu[i, j].item()
+            d_val = abs(k_val - r_val)
+            print(f"  [{i},{j}]  {k_val:<12.2f} {r_val:<12.2f} {d_val:<12.4f}")
+    
+    # 判断是否通过
+    print(f"\n{'='*60}")
+    if max_diff < 1.0:
+        print(f"✓ PASS (max_diff={max_diff:.4f} < 1.0)")
+    else:
+        print(f"✗ FAIL (max_diff={max_diff:.4f} >= 1.0)")
+    print('='*60)
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -558,8 +736,11 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    # 测试单个tile的FP4 GEMM（新增）
-    test_gemm_single_tile()
+    # 测试 E2M1 FP4 GEMM（新增简洁版）
+    test_fp4_e2m1_gemm()
+    
+    # 测试单个tile的FP4 GEMM（详细版）
+    # test_gemm_single_tile()
     
     # 原来的测试（暂时注释）
     # test_gemm()
