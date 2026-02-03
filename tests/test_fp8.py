@@ -654,6 +654,43 @@ def test_gemm_single_tile():
     print(f"="*80)
 
 
+def generate_mxf4_scale_factors(m, n, k, block_k=32, device='cuda'):
+    """
+    为 MXF4 生成正确格式的 Scale Factor
+    
+    MXF4 使用 UE8M0 格式的 SF：
+    - UE8M0: 8位无符号指数，bias=127
+    - 值 = 2^(exp - 127)
+    - exp=127 表示 2^0 = 1（不缩放）
+    
+    SF 布局（与原 FP8 kernel 兼容）：
+    - SFA: [m, sf_k] float32，per-token scaling
+    - SFB: [sf_n, sf_k] float32，per-block scaling
+    
+    为简化测试，生成全 1.0 的 SF（不影响计算）
+    """
+    from deep_gemm.utils import ceil_div
+    
+    # SF 的 K 维度计算
+    # kNumSFStagesPerLoad = 4 (sizeof(uint32_t) / sizeof(float_ue8m0_t))
+    kNumSFStagesPerLoad = 4
+    sf_k = ceil_div(k, block_k * kNumSFStagesPerLoad)
+    
+    # SF 的 M/N 维度（per-token for A, per-128-block for B）
+    sf_n = ceil_div(n, 128)
+    
+    # 生成全 1.0 的 SF（不缩放）
+    sf_a = torch.ones((m, sf_k), dtype=torch.float32, device=device)
+    sf_b = torch.ones((sf_n, sf_k), dtype=torch.float32, device=device)
+    
+    print(f"  [MXF4 SF] Generated scale factors:")
+    print(f"    sf_a shape: {sf_a.shape} (per-token)")
+    print(f"    sf_b shape: {sf_b.shape} (per-block)")
+    print(f"    sf_k = ceil_div({k}, {block_k} * {kNumSFStagesPerLoad}) = {sf_k}")
+    
+    return sf_a, sf_b
+
+
 def test_fp4_e2m1_gemm():
     """
     简洁测试：对比 kernel 输出与 E2M1 FP4 GEMM reference
@@ -665,6 +702,7 @@ def test_fp4_e2m1_gemm():
     # 配置
     m, n, k = 256, 256, 512
     k_packed = k // 8
+    block_k = 32  # kernel 中的 BLOCK_K（int32 单位）
     
     # 数据生成
     from generators import KernelType, MajorTypeAB
@@ -673,12 +711,20 @@ def test_fp4_e2m1_gemm():
     use_ue8m0 = get_ue8m0_usage(kernel_type)
     disable_ue8m0_cast = not use_ue8m0
     
-    a_orig, b_orig, c, d, _ = generate_normal(m, n, k, major_a, major_b, False, torch.float32, use_ue8m0=use_ue8m0)
+    # 生成 FP4 打包数据
     a_packed, _ = generate_random_fp4_as_int32(m, k, device='cuda')
     b_packed, _ = generate_random_fp4_as_int32(n, k, device='cuda')
     
-    a = (a_packed, a_orig[1])
-    b = (b_packed, b_orig[1])
+    # 生成 MXF4 格式的 Scale Factor（全 1.0，不影响计算）
+    sf_a, sf_b = generate_mxf4_scale_factors(m, n, k, block_k=block_k, device='cuda')
+    
+    # 组装输入元组
+    a = (a_packed, sf_a)
+    b = (b_packed, sf_b)
+    
+    # 创建输出张量
+    d = torch.empty((m, n), device='cuda', dtype=torch.float32)
+    c = None  # 不累加
     
     print(f"Config: M={m}, N={n}, K={k}, K_packed={k_packed}")
     
