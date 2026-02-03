@@ -393,7 +393,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<cutlass::float_e4m3_t, cutlass::float_e4m3_t,
         //                                                            float, cutlass::float_ue8m0_t,
         //                                                            UMMA_M, UMMA_N, kMajorA, kMajorB>();
-        // auto sf_desc = make_sf_desc(nullptr);
+        auto sf_desc = make_sf_desc(nullptr);
 
         // // ========== 创建UMMA描述符 ==========
         // DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
@@ -478,26 +478,26 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                         // ========== 在特定阶段执行SF复制 ==========
                         // 注意：CUTLASS UTCCP的接口没有 elect_one_sync，我们必须自己处理
-                        // const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
-                        // if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
-                            // using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
-                            //     cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
+                        const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
+                        if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
+                            using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
+                                cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
 
                             // SFA和SFB复制
                             // TODO: 通过加法处理共享内存描述符
-                            // #pragma unroll
-                            // for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
-                            //     auto smem_ptr = smem_sfa[s] + i * kNumUTCCPAlignedElems;
-                            //     replace_smem_desc_addr(sf_desc, smem_ptr);
-                            //     cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
-                            // }
-                            // #pragma unroll
-                            // for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                            //     auto smem_ptr = smem_sfb[s] + i * kNumUTCCPAlignedElems;
-                            //     replace_smem_desc_addr(sf_desc, smem_ptr);
-                            //     cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
-                            // }
-                        // }
+                            #pragma unroll
+                            for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                                auto smem_ptr = smem_sfa[s] + i * kNumUTCCPAlignedElems;
+                                replace_smem_desc_addr(sf_desc, smem_ptr);
+                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + i * 4);
+                            }
+                            #pragma unroll
+                            for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                auto smem_ptr = smem_sfb[s] + i * kNumUTCCPAlignedElems;
+                                replace_smem_desc_addr(sf_desc, smem_ptr);
+                                cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
+                            }
+                        }
                         __syncwarp();
 
                         // ========== 在领导CTA中发起UMMA ==========
@@ -525,7 +525,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         
                         // 计算 SF 的 TMEM 地址（暂时使用固定地址，后续需要从 UTCCP 获取）
                         // TODO: 恢复 SF 的 UTCCP 复制逻辑后，使用正确的 TMEM 地址
-                        const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
+                        // const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
                         uint32_t tmem_sfa_addr = kTmemStartColOfSFA;  // SF-A 的 TMEM 起始列
                         uint32_t tmem_sfb_addr = kTmemStartColOfSFB;  // SF-B 的 TMEM 起始列
                         
