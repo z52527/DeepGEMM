@@ -81,11 +81,15 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                 const int& m, const int& n, const int& k,
                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                 const std::string& compiled_dims) {
-    const auto& aligned_k = align(k, 128);
-    
     // 检测数据类型：如果是int32，说明是FP4打包数据
     const bool is_fp4_packed = (a.scalar_type() == torch::kInt);
     const auto actual_ab_dtype = is_fp4_packed ? torch::kInt : torch::kFloat8_e4m3fn;
+    
+    // 对齐 K 维度
+    // 对于 FP8：对齐到 128 字节（128 FP8 元素）
+    // 对于 FP4 打包 (int32)：对齐到 32 int32 元素（= 128 字节 = BLOCK_K）
+    const int alignment = is_fp4_packed ? 32 : 128;
+    const auto& aligned_k = align(k, alignment);
     
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::Normal, KernelType::Kernel1D1D,
@@ -102,30 +106,27 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     }
     std::cout << std::endl;
     const auto& cd = c.value_or(d);
+    // 之前禁用 swizzle 导致了 TMA 和 UMMA 之间的内存访问不匹配
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
                                                config.block_k,
                                                static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
-                                               0);
-                                            //    config.smem_config.swizzle_a_mode);
+                                               config.smem_config.swizzle_a_mode);
     const auto& tensor_map_b = make_tma_b_desc(major_b, b, n, k,
                                                SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
                                                config.block_k,
                                                static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
-                                               0);
-                                            //    config.smem_config.swizzle_b_mode);
-    // FP4测试：暂时禁用swizzle，使用简单的行主序布局
-    const int fp4_test_swizzle_mode = 0;  // 临时禁用swizzle
+                                               config.smem_config.swizzle_b_mode);
     const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), 1,
-                                                fp4_test_swizzle_mode);  // 使用0代替swizzle_cd_mode
+                                                config.smem_config.swizzle_cd_mode);
     const auto& tensor_map_c = make_tma_cd_desc(cd, m, n,
                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(cd.stride(-2)), 1,
-                                                fp4_test_swizzle_mode);  // 使用0代替swizzle_cd_mode
+                                                config.smem_config.swizzle_cd_mode);
     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                   config.block_m, config.block_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,

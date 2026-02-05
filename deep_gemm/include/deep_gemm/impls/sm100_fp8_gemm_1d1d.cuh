@@ -11,15 +11,9 @@
 namespace deep_gemm {
 
 using namespace deep_gemm::sm100;
-#define USE_FP4_MMA 1
-// SM100 FP8 GEMM 1D1D kernel实现
-// 这是一个高度优化的GEMM kernel，支持：
-// - FP8精度的矩阵乘法运算
-// - 1D布局的输入矩阵A和B
-// - 支持多种数据布局（行主序/列主序）
-// - 支持分组GEMM和累加操作
-// - 使用TMA（Tensor Memory Accelerator）进行高效内存访问
-// - 使用TMEM（Tensor Memory）进行中间结果存储
+
+// SM100 FP4 GEMM 1D1D kernel实现
+// 支持 MXF4 block-scaled 矩阵乘法
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -39,99 +33,77 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_c,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
-// #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     
     // ========== 基础配置和类型定义 ==========
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
-    // 验证累加操作的数据类型约束：累加操作必须使用FP32输出
     if constexpr (kWithAccumulation)
         DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
 
     // ========== 核心配置参数 ==========
-    constexpr uint32_t LAYOUT_AD_M = 128;                                              // A/D矩阵的M维度布局
-    constexpr uint32_t kNumMWaves = BLOCK_M / LAYOUT_AD_M;                            // M维度的wave数量
-    constexpr uint32_t kNumTMAStoreStages = 2;                                        // TMA存储的流水线阶段数
-    constexpr uint32_t kNumSFStagesPerLoad = sizeof(uint32_t) / sizeof(cutlass::float_ue8m0_t); // 每次加载的缩放因子阶段数
-    constexpr uint32_t kNumUTCCPAlignedElems = 128;                                   // UTCCP对齐的元素数量
+    constexpr uint32_t LAYOUT_AD_M = 128;
+    constexpr uint32_t kNumMWaves = BLOCK_M / LAYOUT_AD_M;
+    constexpr uint32_t kNumTMAStoreStages = 2;
     
-    // 静态断言验证配置的合法性
-    // DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
+    // ========== MXF4 配置 ==========
+    constexpr uint32_t kNumSFStagesPerLoad = 1;
+    constexpr uint32_t kNumUTCCPAlignedElems = 128;
+    constexpr uint32_t FP4_ELEMS_PER_INT32 = 8;
+    constexpr uint32_t MXF4_VS = 32;
+    constexpr uint32_t BLOCK_K_FP4 = BLOCK_K * FP4_ELEMS_PER_INT32;
+    constexpr uint32_t UMMA_K_FP4 = 64;
+    
     DG_STATIC_ASSERT(BLOCK_M % LAYOUT_AD_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
 
     // ========== 动态形状处理 ==========
-    // 如果编译时给出了形状常量，则覆盖运行时参数
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
     const uint32_t shape_sf_k = ceil_div(shape_k, BLOCK_K * kNumSFStagesPerLoad);
 
     // ========== 线程和warp信息 ==========
-    bool is_leader_cta = cute::block_rank_in_cluster() == 0;                          // 是否为集群中的领导CTA
-    const auto warp_idx = cutlass::canonical_warp_idx_sync();                         // 当前warp索引
-    const auto lane_idx = get_lane_idx();                                             // 当前lane索引
+    bool is_leader_cta = cute::block_rank_in_cluster() == 0;
+    const auto warp_idx = cutlass::canonical_warp_idx_sync();
+    const auto lane_idx = get_lane_idx();
 
     // ========== 共享内存分配 ==========
-    // 对齐到1024字节以支持swizzle-128B模式
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
-    // ========== 多播配置和块大小计算 ==========
-    // 2-CTA MMA配置：根据多播设置调整加载和存储块大小
+    // ========== 块大小计算 ==========
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     
-    // 验证多播配置的合法性
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M and BLOCK_M % LAYOUT_AD_M == 0, "Only support tensor memory layout A/D");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
 
     // ========== 共享内存大小计算 ==========
-    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;       // 每个阶段C/D矩阵的共享内存大小
-    constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;    // C/D矩阵总共享内存大小
-    // constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段A矩阵的共享内存大小
-    // constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3); // 每个阶段B矩阵的共享内存大小
+    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
+    constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
+    constexpr uint32_t SMEM_A_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t);
+    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t);
+    constexpr uint32_t SF_BLOCK_M = constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);
+    constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
+    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
     
-    // 物理存储：int32打包数据（TMA实际传输的大小）
-    constexpr uint32_t SMEM_A_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t); // 每个阶段A矩阵打包数据大小
-    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t); // 每个阶段B矩阵打包数据大小
-    
-    // 逻辑大小：解包后的单个FP4数据（用于计算访问）
-    constexpr uint32_t SMEM_A_FP4_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * 8 * sizeof(cutlass::float_e2m1_t); // 每个阶段A矩阵FP4大小（8个FP4每个int32）
-    constexpr uint32_t SMEM_B_FP4_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * 8 * sizeof(cutlass::float_e2m1_t); // 每个阶段B矩阵FP4大小（8个FP4每个int32）
-    
-    constexpr uint32_t SF_BLOCK_M = constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);  // 对齐后的缩放因子块M大小
-    constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);  // 对齐后的缩放因子块N大小
-    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);       // 每个阶段SFA的共享内存大小
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);       // 每个阶段SFB的共享内存大小
-    
-    // 验证：不需要FP4打包验证，因为BLOCK_K已经是int32单位
-    // DG_STATIC_ASSERT(BLOCK_K % 8 == 0, "BLOCK_K must be divisible by 8 for FP4 packing");
-    
-    // 验证共享内存对齐要求
-    DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
+    DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory must be aligned to 1024 bytes");
     DG_STATIC_ASSERT(kNumTMAStoreStages >= 1, "Invalid number of TMA stages");
 
-    // ========== 自动推导epilogue阶段数 ==========
-    // 根据张量内存大小自动推导epilogue阶段数（1或2）
-    // TODO: 测试 kNumMWaves == 2 and kNumEpilogueStages == 2 的情况
-    constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;                             // SFA张量内存列数
-    constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;                             // SFB张量内存列数
-    constexpr uint32_t kNumEpilogueStages = (2 * kNumMWaves * BLOCK_N + kNumSFATmemCols + kNumSFBTmemCols) > 512 ? 1 : 2;
-
     // ========== 张量内存配置 ==========
-    // 计算实际的张量内存大小和偏移量
-    constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * kNumMWaves * BLOCK_N; // 累加器张量内存列数
-    constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>(); // 总张量内存列数
-    constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;                        // SFA在张量内存中的起始列
-    constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;      // SFB在张量内存中的起始列
+    constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
+    constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
+    constexpr uint32_t kNumEpilogueStages = (2 * kNumMWaves * BLOCK_N + kNumSFATmemCols + kNumSFBTmemCols) > 512 ? 1 : 2;
+    constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * kNumMWaves * BLOCK_N;
+    constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
+    constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
+    constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
 
     // ========== TMA描述符预取 ==========
-    // 在最开始预取TMA描述符以减少延迟
     if (threadIdx.x == 0) {
-        // 注意：这里必须使用 reinterpret_cast，否则NVRTC会失败
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
@@ -142,38 +114,22 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     }
 
     // ========== 共享内存指针设置 ==========
-    // 共享内存上的数据（按以下顺序布局）
-    cd_dtype_t* smem_cd[kNumTMAStoreStages];                                          // C/D矩阵共享内存指针数组
-    // cutlass::float_e4m3_t* smem_a[kNumStages];                                       // A矩阵共享内存指针数组
-    // cutlass::float_e4m3_t* smem_b[kNumStages];                                       // B矩阵共享内存指针数组
-    uint32_t* smem_sfa[kNumStages];                                                   // SFA缩放因子共享内存指针数组
-    uint32_t* smem_sfb[kNumStages];                                                   // SFB缩放因子共享内存指针数组
-
-    uint32_t* smem_a_packed[kNumStages];      // 打包后的A矩阵共享内存指针数组
-    uint32_t* smem_b_packed[kNumStages];      // 打包后的B矩阵共享内存指针数组
-    cutlass::float_e2m1_t* smem_a_fp4[kNumStages];                                   // A矩阵单个FP4数据指针（计算用）
-    cutlass::float_e2m1_t* smem_b_fp4[kNumStages];                                   // B矩阵单个FP4数据指针（计算用）
+    cd_dtype_t* smem_cd[kNumTMAStoreStages];
+    uint32_t* smem_sfa[kNumStages];
+    uint32_t* smem_sfb[kNumStages];
+    uint32_t* smem_a_packed[kNumStages];
+    uint32_t* smem_b_packed[kNumStages];
      
-    // 填充D/A/B指针
     #pragma unroll
     for (uint32_t i = 0; i < kNumTMAStoreStages; ++ i)
         smem_cd[i] = reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
-    // #pragma unroll
-    // for (uint32_t i = 0; i < kNumStages; ++ i) {
-    //     smem_a[i] = reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
-    //     smem_b[i] = reinterpret_cast<cutlass::float_e4m3_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
-    // }
+    
     #pragma unroll
     for (uint32_t i = 0; i < kNumStages; ++ i) {
         smem_a_packed[i] = reinterpret_cast<uint32_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_PACKED_SIZE_PER_STAGE);
         smem_b_packed[i] = reinterpret_cast<uint32_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_PACKED_SIZE_PER_STAGE + i * SMEM_B_PACKED_SIZE_PER_STAGE);
-        
-        // 重新解释为NVFP4向量（原地转换）
-        smem_a_fp4[i] = reinterpret_cast<cutlass::float_e2m1_t*>(smem_a_packed[i]);
-        smem_b_fp4[i] = reinterpret_cast<cutlass::float_e2m1_t*>(smem_b_packed[i]);
     }
-    // 填充SFA/SFB指针
-    // auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+    
     auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE);
     #pragma unroll
     for (uint32_t i = 0; i < kNumStages; ++ i) {
@@ -182,48 +138,35 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     }
 
     // ========== 屏障初始化 ==========
-    // 填充屏障对象
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer +
         SMEM_CD_SIZE +
-        // kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
         kNumStages * (SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE) +
         kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
-    auto full_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
-    auto empty_barriers             = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
-    auto with_sf_full_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
-    auto tmem_full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
-    auto tmem_empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
+    auto full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
+    auto empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
+    auto with_sf_full_barriers = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
+    auto tmem_full_barriers    = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
+    auto tmem_empty_barriers   = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
 
-    // ========== 张量内存指针设置 ==========
-    // 填充张量内存指针
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
-    // ========== 屏障和张量内存初始化 ==========
-    // 初始化屏障
     if (threadIdx.x == 0) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            // 在所有CTA上到达
             full_barriers[i]->init(1);
             empty_barriers[i]->init(1);
-            // 仅在领导CTA上到达
             with_sf_full_barriers[i]->init(kNumMulticast * 32);
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
-            // 在所有CTA上到达
             tmem_full_barriers[i]->init(1);
-            // 仅在领导CTA上到达
             tmem_empty_barriers[i]->init(kNumMulticast * kNumEpilogueThreads);
         }
-
-        // 使初始化的屏障在异步代理中可见
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::fence_barrier_init();
     } 
     else if (threadIdx.x >= 32 and threadIdx.x < 64) {
-        // 分配张量内存
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
@@ -233,85 +176,57 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, grouped_layout);
 
     // ========== K维度迭代控制 ==========
-    // 用于流水线展开的结构体
-    struct DivisibleK {};      // K维度可整除的情况
-    struct NotDivisibleK {};   // K维度不可整除的情况
-    uint32_t phase = 0;        // 流水线相位
+    struct DivisibleK {};
+    struct NotDivisibleK {};
+    uint32_t phase = 0;
     
-    // K维度迭代启动器：处理完整的K维度循环
     auto launch_k_iterations = [&](const auto& func) {
         const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
         const uint32_t num_iterations = ceil_div(current_shape_k, kNumStages * BLOCK_K);
         const uint32_t num_last_stages = ceil_div(current_shape_k, BLOCK_K) % kNumStages;
 
-        // TODO: 重构这里的逻辑
         if (num_last_stages == 0) {
-            // K维度完全可整除的情况
             for (uint32_t k_iter = 0; k_iter < num_iterations; ++ k_iter, phase ^= 1)
                 func(k_iter, DivisibleK{}, k_iter == num_iterations - 1, num_last_stages);
         } else {
-            // K维度不完全整除的情况
             for (uint32_t k_iter = 0; k_iter < num_iterations - 1; ++ k_iter, phase ^= 1)
                 func(k_iter, DivisibleK{}, false, num_last_stages);
             func(num_iterations - 1, NotDivisibleK{}, true, num_last_stages), phase ^= 1;
         }
     };
 
-    // 累加阶段索引分发器：根据epilogue阶段数进行分发
     auto dispatch_accum_stage_idx = [&](uint32_t accum_stage_idx, const auto& func) {
-        DG_STATIC_ASSERT(1 <= kNumEpilogueStages and kNumEpilogueStages <= 2,
-                         "Too many epilogue stages, please modify the Python heuristic as well");
+        DG_STATIC_ASSERT(1 <= kNumEpilogueStages and kNumEpilogueStages <= 2, "Too many epilogue stages");
         accum_stage_idx == 0 ? func(0) : func(1);
     };
 
     // ========== Warp角色分发 ==========
-    // 将warp分配到不同的角色
     if (warp_idx == 0) {
         // ========== TMA加载warp ==========
-        // 持续调度处理块
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            // 调试：打印CTA信息（只在第一次迭代打印）
-            if (lane_idx == 0 && scheduler.current_iter == 0) {
-                printf("CTA Info: blockIdx=%d, m_block=%d, n_block=%d, cluster_rank=%d\n",
-                       blockIdx.x, m_block_idx, n_block_idx,
-                       cute::block_rank_in_cluster());
-            }
-            
             launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                 constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                 const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                    // 等待消费者释放
                     empty_barriers[s]->wait(phase ^ 1);
 
-                    // ========== 计算全局索引偏移 ==========
-                    // 注意：组总是与外部维度连接
-                    uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), KGroupedIndexType::MN> (
-                        shape_m, BLOCK_M, m_block_idx);
-                    uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), KGroupedIndexType::MN> (
-                        shape_n, BLOCK_N, n_block_idx, m_block_idx);
-
-                    // 注意：k_idx实际上是K-major的默认k索引，而k_b_idx可能是MN-major
-                    // 对于所有m-grouped GEMM，A必须是K-majored
+                    uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx);
+                    uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), KGroupedIndexType::MN>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                    
                     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous or kMajorA == cute::UMMA::Major::K, "Invalid major");
                     uint32_t k_block_idx = k_iter * kNumStages + s;
                     uint32_t k_idx = k_block_idx * BLOCK_K;
-                    uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), KGroupedIndexType::K> (
-                        shape_k, BLOCK_K, k_block_idx, m_block_idx);
-                    uint32_t k_b_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::MN), KGroupedIndexType::K> (
-                        shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                    uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), KGroupedIndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                    uint32_t k_b_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::MN), KGroupedIndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
 
-                    // 添加2-CTA偏移
                     if constexpr (kNumMulticast > 1) {
                         m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * LOAD_BLOCK_M) : 0;
                         n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
                     }
 
-                    // ========== 发起TMA传输 ==========
                     if (cute::elect_one_sync()) {
-                        // 根据矩阵布局发起相应的TMA复制（BLOCK_K已经是int32单位，不需要除以8）
                         if constexpr (kMajorA == cute::UMMA::Major::K)
                             tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], k_a_idx, m_idx);
                         if constexpr (kMajorA == cute::UMMA::Major::MN)
@@ -323,7 +238,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     }
                     auto num_arrival_bytes = SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE;
 
-                    // ========== 在特定阶段发起SFA和SFB TMA ==========
                     const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
                     if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
                         tma_copy<BLOCK_M, 1, 0, 1>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M,
@@ -333,12 +247,10 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         num_arrival_bytes += (BLOCK_M + BLOCK_N) * sizeof(uint32_t);
                     }
 
-                    // 到达满屏障
                     if (cute::elect_one_sync())
                         full_barriers[s]->arrive_and_expect_tx(num_arrival_bytes);
                 }
 
-                // 等待未对齐的情况
                 #pragma unroll
                 for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                     empty_barriers[s]->wait(phase ^ 1);
@@ -348,35 +260,17 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             });
         }
     } else if (warp_idx == 1 and is_leader_cta) {
-        // ========== MMA发起warp ==========
-        // 注意：只有领导CTA会执行此操作
-        
-        // ========== MXF4 MMA 配置 (SM100_MMA_MXF4_SS，需要 Scale Factor) ==========
-        // MXF4 使用紧凑打包格式，支持 block scaling
-        // FP4 元素维度：每个 int32 包含 8 个 FP4 元素
-        constexpr uint32_t FP4_ELEMS_PER_INT32 = 8;
-        constexpr uint32_t BLOCK_K_FP4 = BLOCK_K * FP4_ELEMS_PER_INT32;  // FP4 元素单位的 K 维度
-        constexpr uint32_t UMMA_K_FP4 = 64;  // MXF4 每次处理 64 个 FP4 元素（256 bits / 4 bits）
-        constexpr uint32_t NUM_K_ITERS = BLOCK_K_FP4 / UMMA_K_FP4;  // K 维度的 MMA 迭代次数
-        
-        // MXF4 Scale Factor Vector Size: 每 VS 个 FP4 元素共享一个 SF
-        // VS=32 使用 mxf4 指令，VS=16 使用 mxf4nvf4 指令
-        constexpr uint32_t MXF4_VS = 32;
-        
-        // UMMA 形状配置
+        // ========== MMA发起warp (MXF4) ==========
         constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
         constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
+        constexpr uint32_t UMMA_K_INT32 = UMMA_K_FP4 / FP4_ELEMS_PER_INT32;
+        constexpr uint32_t NUM_K_ITERS_PER_STAGE = BLOCK_K / UMMA_K_INT32;
+        constexpr uint32_t NUM_N_ITERS = BLOCK_N / UMMA_N;
         
-        // 创建 MXF4 MMA 指令描述符（带 Block Scale）
         auto instr_desc_mxf4 = cute::UMMA::make_instr_desc_block_scaled<
-            cutlass::float_e2m1_t,    // A type: FP4 E2M1
-            cutlass::float_e2m1_t,    // B type: FP4 E2M1
-            float,                     // C type: FP32
-            cutlass::float_ue8m0_t,   // SF type: UE8M0 (OCP 标准)
-            UMMA_M, UMMA_N,
-            kMajorA, kMajorB>();
+            cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
+            UMMA_M, UMMA_N, kMajorA, kMajorB>();
         
-        // MMA 类型定义（MXF4 版本，带 Scale Factor）
         using cute_mma_mxf4_t = cute::conditional_t<kNumMulticast == 1,
             cute::SM100_MMA_MXF4_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
                                     cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
@@ -385,45 +279,16 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                           cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
                                           kMajorA, kMajorB>>;
         
-        // ========== 旧的 MXF8F6F4 配置（带 Scale Factor）==========
-        // TODO: 重构 UMMA_M 计算
-        // constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
-        // constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
-        // constexpr uint32_t UMMA_K = 32 / sizeof(cutlass::float_e4m3_t);
-        // auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<cutlass::float_e4m3_t, cutlass::float_e4m3_t,
-        //                                                            float, cutlass::float_ue8m0_t,
-        //                                                            UMMA_M, UMMA_N, kMajorA, kMajorB>();
         auto sf_desc = make_sf_desc(nullptr);
-
-        // // ========== 创建UMMA描述符 ==========
-        // DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-        // auto a_desc = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
-        // auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
-        // uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
-        // uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
-
-        // // ========== MMA指令检查 ==========
-        // // 注意：CUTLASS除了MMA特征外没有这样的检查，但我们不使用这些特征
-        // DG_STATIC_ASSERT((UMMA_M == 64  and UMMA_N %  8 == 0 and  8 <= UMMA_N and UMMA_N <= 256) or
-        //                  (UMMA_M == 128 and UMMA_N % 16 == 0 and 16 <= UMMA_N and UMMA_N <= 256) or
-        //                  (UMMA_M == 256 and UMMA_N % 16 == 0 and 16 <= UMMA_N and UMMA_N <= 256),
-        //                  "Invalid MMA instruction shape");
         
-        // ========== MXF4 MMA 形状检查 ==========
-        // MXF4 要求 M=128，N 是 8-256 的 8 的倍数
         DG_STATIC_ASSERT(UMMA_M == 128, "MXF4 requires M=128");
-        DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256),
-                         "MXF4 N-mode size should be a multiple of 8 between 8 and 256");
+        DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256), "Invalid MXF4 N-mode size");
 
-        // ========== 持续调度处理块 ==========
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
-                // 等待张量内存空屏障到达
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
-                // tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
                 tcgen05_after_thread_sync();
 
-                // ========== 空屏障到达处理 ==========
                 auto empty_barrier_arrive = [&](uint32_t s, bool do_tmem_full_arrive) {
                     auto umma_arrive = [](const uint64_t* barrier) {
                         if constexpr (kNumMulticast == 1) {
@@ -434,57 +299,22 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         }
                     };
                     umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[s]));
-
-                    // 注意：张量内存累加器流水线与多播无关
-                    // if (do_tmem_full_arrive)
-                    //     umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
                 };
 
-                // ========== 启动MMA ==========
                 launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                     constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
                     const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                        // 等待TMA和SF转置到达
                         with_sf_full_barriers[s]->wait(phase);
-                        // tcgen05_after_thread_sync();
 
-                        // ========== 数据加载调试输出（只输出一次）==========
-                        if (threadIdx.x == 32 && k_iter == 0 && s == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                            // A矩阵的前4个int32值
-                            uint32_t a_val0 = smem_a_packed[s][0];
-                            uint32_t a_val1 = smem_a_packed[s][1];
-                            uint32_t a_val2 = smem_a_packed[s][2];
-                            uint32_t a_val3 = smem_a_packed[s][3];
-                            
-                            // B矩阵的前4个int32值
-                            uint32_t b_val0 = smem_b_packed[s][0];
-                            uint32_t b_val1 = smem_b_packed[s][1];
-                            uint32_t b_val2 = smem_b_packed[s][2];
-                            uint32_t b_val3 = smem_b_packed[s][3];
-                            
-                            printf("KERNEL_DEBUG: A first_4_int32: [0]=0x%08x [1]=0x%08x [2]=0x%08x [3]=0x%08x\n", 
-                                   a_val0, a_val1, a_val2, a_val3);
-                            printf("KERNEL_DEBUG: B first_4_int32: [0]=0x%08x [1]=0x%08x [2]=0x%08x [3]=0x%08x\n", 
-                                   b_val0, b_val1, b_val2, b_val3);
-                                // 打印B[1]的前2个int32（用于C[0][1]计算）
-                            uint32_t b_1_0 = smem_b_packed[s][1 * BLOCK_K + 0];  // B[1][0]
-                            uint32_t b_1_1 = smem_b_packed[s][1 * BLOCK_K + 1];  // B[1][1]
-                            printf("KERNEL_DEBUG: B[1] first 2: [0]=0x%08x [1]=0x%08x\n", b_1_0, b_1_1);
-
-                        }
-
-                        // ========== 在特定阶段执行SF复制 ==========
-                        // 注意：CUTLASS UTCCP的接口没有 elect_one_sync，我们必须自己处理
+                        // SF复制到TMEM
                         const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
                         if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
                             using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
                                 cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
 
-                            // SFA和SFB复制
-                            // TODO: 通过加法处理共享内存描述符
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = smem_sfa[s] + i * kNumUTCCPAlignedElems;
@@ -500,257 +330,58 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         }
                         __syncwarp();
 
-                        // ========== 在领导CTA中发起UMMA ==========
-                        // using cute_mma_t = cute::conditional_t<kNumMulticast == 1,
-                        //     cute::SM100_MMA_MXF8F6F4_SS      <cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
-                        //                                       cutlass::float_ue8m0_t, UMMA_M, UMMA_N, kMajorA, kMajorB>,
-                        //     cute::SM100_MMA_MXF8F6F4_2x1SM_SS<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
-                        //                                       cutlass::float_ue8m0_t, UMMA_M, UMMA_N, kMajorA, kMajorB>>;
-                        // const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_stage_in_group_idx);
-                        // const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, s);
-                        // const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, s);
-                        
-// 定义宏来选择实现方式：MMA 或 CUDA Core
-// #define USE_FP4_MMA 1  // 设为 1 使用 UMMA，设为 0 使用 CUDA Core
-                        
-#ifdef USE_FP4_MMA
-                        // ========== MXF4 MMA 实现 (SM100_MMA_MXF4_SS) ==========
-                        // MXF4 支持紧凑打包的 SMEM 格式
-                        // SMEM 数据以 uint32_t 格式存储（每个 uint32 包含 8 个 FP4）
-                        
-                        // K 维度计算（以 FP4 元素为单位）
-                        // UMMA_K_FP4 = 64 意味着每次 MMA 处理 64 个 FP4 元素 = 8 个 uint32
-                        constexpr uint32_t UMMA_K_INT32 = UMMA_K_FP4 / FP4_ELEMS_PER_INT32;  // = 8
-                        constexpr uint32_t NUM_K_ITERS_PER_STAGE = BLOCK_K / UMMA_K_INT32;   // K 方向 MMA 迭代次数
-                        
-                        // 计算 SF 的 TMEM 地址（暂时使用固定地址，后续需要从 UTCCP 获取）
-                        // TODO: 恢复 SF 的 UTCCP 复制逻辑后，使用正确的 TMEM 地址
-                        // const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
-                        uint32_t tmem_sfa_addr = kTmemStartColOfSFA;  // SF-A 的 TMEM 起始列
-                        uint32_t tmem_sfb_addr = kTmemStartColOfSFB;  // SF-B 的 TMEM 起始列
-                        
-                        // 创建运行时指令描述符（包含 SF ID）
-                        const auto runtime_instr_desc_mxf4 = cute::UMMA::make_runtime_instr_desc_block_scaled(
-                            instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
-                        
-                        // 调试输出 MMA 配置
-                        if (threadIdx.x == 32 && k_iter == 0 && s == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                            printf("MXF4_MMA_CONFIG: UMMA_M=%u, UMMA_N=%u, UMMA_K_FP4=%u (UMMA_K_INT32=%u)\n", 
-                                   UMMA_M, UMMA_N, UMMA_K_FP4, UMMA_K_INT32);
-                            printf("MXF4_MMA_CONFIG: BLOCK_K=%u (int32), BLOCK_K_FP4=%u, NUM_K_ITERS_PER_STAGE=%u\n", 
-                                   BLOCK_K, BLOCK_K_FP4, NUM_K_ITERS_PER_STAGE);
-                            printf("MXF4_MMA_CONFIG: MXF4_VS=%u, kNumMWaves=%u\n", MXF4_VS, kNumMWaves);
-                            printf("MXF4_MMA_CONFIG: tmem_sfa_addr=%u, tmem_sfb_addr=%u\n", tmem_sfa_addr, tmem_sfb_addr);
-                        }
-                        
                         tcgen05_after_thread_sync();
                         
-                        // K 维度循环：每次 MMA 处理 UMMA_K_INT32 个 uint32（= 64 个 FP4 元素）
+                        // 创建 descriptor
+                        constexpr uint32_t SMEM_A_SIZE_PER_STAGE_PACKED = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t);
+                        constexpr uint32_t SMEM_B_SIZE_PER_STAGE_PACKED = LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t);
+                        
+                        auto a_desc_base = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a_packed[0], 0, 0);
+                        auto b_desc_base = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b_packed[0], 0, 0);
+                        
+                        uint32_t a_desc_stage_lo = a_desc_base.lo + s * SMEM_A_SIZE_PER_STAGE_PACKED / 16;
+                        uint32_t b_desc_stage_lo = b_desc_base.lo + s * SMEM_B_SIZE_PER_STAGE_PACKED / 16;
+                        
+                        uint32_t tmem_sfa_addr = kTmemStartColOfSFA;
+                        uint32_t tmem_sfb_addr = kTmemStartColOfSFB;
+                        const auto runtime_instr_desc_mxf4 = cute::UMMA::make_runtime_instr_desc_block_scaled(
+                            instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+
+                        // MMA 循环
                         #pragma unroll
                         for (uint32_t k = 0; k < NUM_K_ITERS_PER_STAGE; ++k) {
-                            // 创建 B 描述符：使用 uint32_t 类型和原始 BLOCK_K
-                            // SMEM 布局：[LOAD_BLOCK_N, BLOCK_K] (uint32_t)
-                            auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(
-                                smem_b_packed[s], 0, k * UMMA_K_INT32);
-                            
-                            // M waves 循环
                             #pragma unroll
-                            for (uint32_t w = 0; w < kNumMWaves; ++w) {
-                                // 创建 A 描述符：使用 uint32_t 类型和原始 BLOCK_K
-                                // SMEM 布局：[LOAD_BLOCK_M, BLOCK_K] (uint32_t)
-                                auto a_desc = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(
-                                    smem_a_packed[s], w * LAYOUT_AD_M, k * UMMA_K_INT32);
+                            for (uint32_t n = 0; n < NUM_N_ITERS; ++n) {
+                                auto b_desc = b_desc_base;
+                                b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, uint32_t>(
+                                    b_desc_stage_lo, n * UMMA_N * BLOCK_K, k * UMMA_K_INT32);
                                 
-                                // TMEM 列偏移：累加器在 TMEM 中的位置
-                                uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N;
-                                
-                                // 是否累加（第一次 MMA 不累加，后续累加）
-                                bool do_accumulate = (k_iter > 0 || s > 0 || k > 0);
-                                
-                                // 调用 MXF4 MMA：需要传入 SF 的 TMEM 地址
-                                cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate, 
-                                                     runtime_instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                                #pragma unroll
+                                for (uint32_t w = 0; w < kNumMWaves; ++w) {
+                                    auto a_desc = a_desc_base;
+                                    a_desc.lo = advance_umma_desc_lo<kMajorA, BLOCK_M, kSwizzleAMode, uint32_t>(
+                                        a_desc_stage_lo, w * LAYOUT_AD_M * BLOCK_K, k * UMMA_K_INT32);
+                                    
+                                    uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
+                                    bool do_accumulate = (k_iter > 0 || s > 0 || k > 0);
+                                    
+                                    cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate, 
+                                                         runtime_instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                                }
                             }
                         }
                         
                         tcgen05_before_thread_sync();
                         
-                        // 在最后一个 K 迭代完成后，通知 epilogue 数据准备好
                         if (is_last_iter && s == kNumInnerStages - 1) {
                             if (cute::elect_one_sync()) {
                                 tmem_full_barriers[accum_stage_idx]->arrive();
                             }
                         }
-#else
-                        // ========== 简单数据验证实现（避免溢出）==========
-                        // 线程分工：MMA warp有32个线程 (threadIdx.x = 32-63)
-                        const uint32_t thread_id = threadIdx.x - 32;  // 0-31
-                        const uint32_t total_threads = 32;
-                        
-                        // 计算输出矩阵的总元素数
-                        const uint32_t total_output_elements = LOAD_BLOCK_M * LOAD_BLOCK_N;
-                        
-                        
-                        // ========== 新增：FP4 GEMM真正的矩阵乘法实现 ==========
-                        // 使用单独的共享内存累加器进行GEMM计算
-                        static __shared__ float shared_gemm_accumulator[4096];  // FP32累加器用于GEMM
-                        
-                        // 初始化GEMM累加器（只在第一个K迭代的第一个stage）
-                        if (k_iter == 0 && s == 0) {
-                            for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
-                                shared_gemm_accumulator[elem_idx] = 0.0f;
-                            }
-                        }
-                        __syncwarp();
-                        
-                        // 计算真正的FP4 GEMM：解包并做矩阵乘法
-                        for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
-                            const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
-                            const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
-                            
-                            float local_acc = 0.0f;
-                            
-                            // 调试标志：是否为C[0][1]
-                            bool debug_elem = (out_m == 0 && out_n == 1 && thread_id == 0 && 
-                                              m_block_idx == 0 && n_block_idx == 0);
-                            
-                            if (debug_elem) {
-                                printf("\n=== KERNEL: Computing C[0][1], showing first 16 FP4 elements ===\n");
-                            }
-                            
-                            // K维度循环：遍历所有打包的K值
-                            for (uint32_t k_packed = 0; k_packed < BLOCK_K; ++k_packed) {
-                                uint32_t a_packed, b_packed;
-                                
-                                // 根据矩阵主序获取正确的数据（与上面SUM/XOR验证相同的逻辑）
-                                if constexpr (kMajorA == cute::UMMA::Major::K) {
-                                    a_packed = smem_a_packed[s][out_m * BLOCK_K + k_packed];
-                                } else {
-                                    a_packed = smem_a_packed[s][k_packed * LOAD_BLOCK_M + out_m];
-                                }
-                                
-                                if constexpr (kMajorB == cute::UMMA::Major::K) {
-                                    b_packed = smem_b_packed[s][out_n * BLOCK_K + k_packed];
-                                } else {
-                                    b_packed = smem_b_packed[s][k_packed * LOAD_BLOCK_N + out_n];
-                                }
-                                
-                                // 调试：打印前2个k_packed的打包值
-                                if (debug_elem && k_packed < 2) {
-                                    printf("k_packed=%u: a_packed=0x%08x, b_packed=0x%08x\n", 
-                                           k_packed, a_packed, b_packed);
-                                }
-                                
-                                // 解包并计算：每个int32包含8个FP4值
-                                #pragma unroll
-                                for (int fp4_idx = 0; fp4_idx < 8; ++fp4_idx) {
-                                    // 提取第fp4_idx个4-bit值（0-15）
-                                    uint32_t a_fp4 = (a_packed >> (fp4_idx * 4)) & 0xF;
-                                    uint32_t b_fp4 = (b_packed >> (fp4_idx * 4)) & 0xF;
-                                    
-                                    // 调试：打印前16个FP4元素的详细计算（前2个k_packed，每个8个FP4）
-                                    if (debug_elem && k_packed < 2) {
-                                        uint32_t global_k_idx = k_packed * 8 + fp4_idx;
-                                        uint32_t product = a_fp4 * b_fp4;
-                                        printf("  k=%2u: a_fp4=%2u, b_fp4=%2u, product=%3u, acc_before=%.1f, acc_after=%.1f\n",
-                                               global_k_idx, a_fp4, b_fp4, product, local_acc, local_acc + (float)product);
-                                    }
-                                    
-                                    // 转换为float并累加（将4-bit值当作整数0-15）
-                                    local_acc += static_cast<float>(a_fp4) * static_cast<float>(b_fp4);
-                                }
-                            }
-                            
-                            if (debug_elem) {
-                                printf("Final accumulated value for C[0][1]: %.2f\n", local_acc);
-                            }
-                            
-                            // 累加到共享内存GEMM累加器中
-                            atomicAdd(&shared_gemm_accumulator[elem_idx], local_acc);
-                        }
-                        __syncwarp();
-                        
-                        // 在最后一个K stage输出GEMM结果并写回
-                        if (is_last_iter && s == kNumInnerStages - 1) {
-                            // 调试输出前4x4的GEMM结果
-                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                                printf("\nKERNEL_GEMM: FP4 GEMM Results [first 4x4]:\n");
-                                for (uint32_t i = 0; i < min(4u, LOAD_BLOCK_M); ++i) {
-                                    for (uint32_t j = 0; j < min(4u, LOAD_BLOCK_N); ++j) {
-                                        uint32_t idx = i * LOAD_BLOCK_N + j;
-                                        printf("  GEMM[%u][%u] = %.2f\n", i, j, shared_gemm_accumulator[idx]);
-                                    }
-                                }
-                            }
-                            
-                            // 将GEMM结果写入到smem_cd供epilogue使用
-                            const uint32_t tma_stage_idx = 0;
-                            const uint32_t max_write_m = min(LOAD_BLOCK_M, STORE_BLOCK_M);
-                            const uint32_t max_write_n = min(LOAD_BLOCK_N, STORE_BLOCK_N);
-                            
-                            // 调试输出维度信息
-                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                                printf("KERNEL_DIM_INFO: LOAD_BLOCK_M=%u, LOAD_BLOCK_N=%u\n", LOAD_BLOCK_M, LOAD_BLOCK_N);
-                                printf("KERNEL_DIM_INFO: STORE_BLOCK_M=%u, STORE_BLOCK_N=%u\n", STORE_BLOCK_M, STORE_BLOCK_N);
-                                printf("KERNEL_DIM_INFO: BLOCK_M=%u, BLOCK_N=%u, BLOCK_K=%u\n", BLOCK_M, BLOCK_N, BLOCK_K);
-                                printf("KERNEL_DIM_INFO: kNumMWaves=%u, kNumEpilogueStages=%u\n", kNumMWaves, kNumEpilogueStages);
-                                printf("KERNEL_DIM_INFO: kSwizzleCDMode=%u, sizeof(cd_dtype_t)=%u\n", kSwizzleCDMode, (uint32_t)sizeof(cd_dtype_t));
-                                printf("KERNEL_DIM_INFO: accum_stage_idx=%u, accum_phase_idx=%u\n", accum_stage_idx, accum_phase_idx);
-                            }
-                            
-                            // 写入GEMM结果到smem_cd
-                            for (uint32_t elem_idx = thread_id; elem_idx < total_output_elements; elem_idx += total_threads) {
-                                const uint32_t out_m = elem_idx / LOAD_BLOCK_N;
-                                const uint32_t out_n = elem_idx % LOAD_BLOCK_N;
-                                
-                                // 只写入STORE_BLOCK范围内的数据（第一个wave的第一个store）
-                                if (out_m < STORE_BLOCK_M && out_n < STORE_BLOCK_N) {
-                                    float result = shared_gemm_accumulator[elem_idx];
-                                    // smem_cd布局：行主序，每行STORE_BLOCK_N个元素
-                                    uint32_t smem_idx = out_m * STORE_BLOCK_N + out_n;
-                                    smem_cd[tma_stage_idx][smem_idx] = static_cast<cd_dtype_t>(result);
-                                }
-                            }
-                            __syncwarp();
-                            
-                            // 调试：打印写入smem_cd后的前几个值
-                            if (thread_id == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                                printf("KERNEL_SMEM_CD: After write, first 4 values:\n");
-                                for (uint32_t i = 0; i < 4; ++i) {
-                                    float val = static_cast<float>(smem_cd[tma_stage_idx][i]);
-                                    printf("  smem_cd[%u][%u] = %.2f\n", tma_stage_idx, i, val);
-                                }
-                            }
-                            
-                            // 通知Epilogue数据已准备好
-                            if (cute::elect_one_sync()) {
-                                tmem_full_barriers[accum_stage_idx]->arrive();
-                            }
-                        }
-                        
-                        // 嵌套循环执行实际的矩阵乘法运算
-                        // #pragma unroll
-                        // for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                        //     b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t>(b_desc_base_lo, 0, k * UMMA_K);
-                        //     #pragma unroll
-                        //     for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                        //         a_desc.lo = advance_umma_desc_lo<kMajorA, BLOCK_M, kSwizzleAMode, cutlass::float_e4m3_t>(a_desc_base_lo, w * LAYOUT_AD_M * BLOCK_K, k * UMMA_K);
-                        //         cute_mma_t::fma(a_desc, b_desc,
-                        //                         accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
-                        //                         k_iter > 0 or s > 0 or k > 0,
-                        //                         runtime_instr_desc,
-                        //                         kTmemStartColOfSFA + w * (kNumUTCCPAlignedElems / 32),
-                        //                         kTmemStartColOfSFB);
-                        //     }
-                        // }
-#endif  // USE_FP4_MMA
 
-                        // 提交到mbarrier对象
-                        // 不需要显式的 tcgen05.fence::before_thread_sync，因为这已经被 tcgen05.commit 隐式执行
                         empty_barrier_arrive(s, is_last_iter and s == kNumInnerStages - 1);
                     }
 
-                    // 等待未对齐的情况
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                         with_sf_full_barriers[s]->wait(phase);
@@ -761,25 +392,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         }
     } else if (warp_idx == 2) {
         // ========== UTCCP转置器warp ==========
-        
-        // UTCCP所需的共享内存warp转置函数
-        // auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
-        //     DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
-        //     uint32_t values[4];
-            
-        //     // 读取数据
-        //     #pragma unroll
-        //     for (uint32_t i = 0; i < 4; ++ i)
-        //         values[i] = ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
-        //     __syncwarp();
-            
-        //     // 写回转置后的数据
-        //     #pragma unroll
-        //     for (uint32_t i = 0; i < 4; ++ i)
-        //         st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
-        // };
-
-        // ========== 持续调度处理块 ==========
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                 constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
@@ -787,28 +399,10 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                    // 等待TMA到达
                     full_barriers[s]->wait(phase);
-
-                    // 在特定阶段为UTCCP执行转置
-                    // const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
-                    // if (sf_stage_in_group_idx == 0) {
-                    //     // 对SFA和SFB执行转置
-                    //     #pragma unroll
-                    //     for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
-                    //         utccp_required_smem_warp_transpose(smem_sfa[s] + i * kNumUTCCPAlignedElems);
-                    //     #pragma unroll
-                    //     for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
-                    //         utccp_required_smem_warp_transpose(smem_sfb[s] + i * kNumUTCCPAlignedElems);
-                    //     // TODO: 确定代理栅栏对2-CTA情况是否有效
-                    //     cutlass::arch::fence_view_async_shared();
-                    // }
-
-                    // 到达屏障
                     with_sf_full_barriers[s]->arrive(0u);
                 }
 
-                // 等待未对齐的情况
                 #pragma unroll
                 for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                     full_barriers[s]->wait(phase);
@@ -821,57 +415,30 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         const auto epilogue_thread_idx = threadIdx.x - kNumNonEpilogueThreads;
         const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
 
-        // 注意：张量内存地址被简化，因为硬件会忽略warp索引位，
-        // 即不需要 tmem_ptr |= (epilogue_warp_idx * 32) << 16
-        // 注意：我们也禁止两个CTA共享相同的SM及其张量内存
         DG_TRAP_ONLY_DEVICE_ASSERT(ld_shared(tmem_ptr_in_smem) == 0);
 
-        // ========== TMA检查 ==========
         constexpr uint32_t kNumBankGroupBytes = 16;
         constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
-        // FP4测试：暂时禁用swizzle断言
-        // DG_STATIC_ASSERT(kSwizzleCDMode > 0, "TMA D must be swizzled");
-        // DG_STATIC_ASSERT(STORE_BLOCK_N % kNumElemsPerBankGroup == 0, "Invalid swizzling");
 
-        // ========== 持续调度处理块 ==========
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 
-                // ========== 刷新TMA存储 ==========
-                // 注意：对于第一次存储，我们必须刷新所有之前的TMA，
-                // 因为我们不在两个块之间共享流水线阶段
                 if (epilogue_thread_idx == 0)
                     cute::tma_store_wait<0>();
                 cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
 
-                // 等待MMA warp完成数据写入到smem_cd
                 tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
                 tcgen05_after_thread_sync();
-                
-                // 调试输出
-                if (epilogue_thread_idx == 0 && m_block_idx == 0 && n_block_idx == 0) {
-                    printf("KERNEL_EPILOGUE: Barrier passed! accum_stage_idx=%u, accum_phase_idx=%u\n", 
-                           accum_stage_idx, accum_phase_idx);
-                    printf("KERNEL_EPILOGUE: smem_cd[0] first 4 values:\n");
-                    for (uint32_t i = 0; i < 4; ++i) {
-                        float val = static_cast<float>(smem_cd[0][i]);
-                        printf("  smem_cd[0][%u] = %.2f\n", i, val);
-                    }
-                }
 
-                // ========== 从张量内存加载到寄存器，并用STSM写入共享内存 ==========
                 DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
                 DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
 
-                // 遍历M waves
                 #pragma unroll
                 for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                    // 发起每个交织原子并流水线化STSM和TMA存储
                     constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumStores; ++ s) {
-                        // 等待共享内存被释放
                         const uint32_t iter_idx = w * kNumStores + s;
                         if (iter_idx >= kNumTMAStoreStages) {
                             if (epilogue_thread_idx == 0)
@@ -879,65 +446,41 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
                         }
 
-                        // ========== 计算流水线阶段和索引 ==========
                         const auto tma_stage_idx = iter_idx % kNumTMAStoreStages;
                         const auto m_idx = scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * LAYOUT_AD_M;
                         const auto n_idx = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
 
-                        // ========== 存储到共享内存 ==========
                         #pragma unroll
                         for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
-                            // 计算原子中要写入的bank group索引
                             auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
-
-                            // 在另一个视图中重塑原子并交织
-                            //  - 原始：(LAYOUT_AD_M, kSwizzleCDMode / kNumBankGroupBytes)
-                            //  - 新：(LAYOUT_AD_M * kSwizzleCDMode / kNumBankGroupBytes / 8, 8)
-                            // 注意："8"是bank group的数量，"16"是交织模式
                             constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
                             auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
                             auto col = kHasShortcut ? (i) : (bank_group_index % 8);
                             col ^= row % (kSwizzleCDMode / 16);
 
-                            // 源和目标内存地址
-                            uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N +               // 累加器偏移
-                                                 w * BLOCK_N +                                          // Wave偏移
-                                                 s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // 块内偏移
-                            auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +        // 基指针
-                                            epilogue_warp_idx * 32 * kSwizzleCDMode +                   // Warp偏移
-                                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // 原子内偏移
+                            uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
+                            auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                            epilogue_warp_idx * 32 * kSwizzleCDMode +
+                                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
 
-                            // ========== 从张量内存加载，存储到共享内存 ==========
                             uint32_t values[kNumElemsPerBankGroup];
                             if constexpr (cute::is_same_v<cd_dtype_t, float>) {
-                                // 对于FP32输出，读取并存储
                                 DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
-                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
-                                    values[0], values[1], values[2], values[3]);
+                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
                                 cutlass::arch::fence_view_async_tmem_load();
                                 st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
-                                printf("values[0] = %f, values[1] = %f, values[2] = %f, values[3] = %f\n", values[0], values[1], values[2], values[3]);
                             } 
                         }
 
-                        // ========== 尽快通知张量内存空（仅在领导CTA）到达 ==========
-                        // 注意：只有最后一个阶段需要这样做
                         if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
                             tcgen05_before_thread_sync();
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         }
                         __syncwarp();
 
-                        // ========== 同步所有线程并发起TMA ==========
                         cute::tma_store_fence();
                         cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
                         if (epilogue_thread_idx == 0) {
-                            // 调试输出TMA Store参数（只输出第一个块的第一次store）
-                            if (m_block_idx == 0 && n_block_idx == 0 && w == 0 && s == 0) {
-                                printf("KERNEL_TMA_STORE: w=%u, s=%u, tma_stage_idx=%u, m_idx=%u, n_idx=%u\n",
-                                       w, s, tma_stage_idx, m_idx, n_idx);
-                            }
-                            
                             using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                 cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                             cute_tma_t::copy(&tensor_map_d, smem_cd[tma_stage_idx], n_idx, m_idx);
@@ -948,25 +491,15 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             });
         }
 
-        // ========== 刷新流水线中的所有阶段以使TMA存储对下一个kernel可见 ==========
         if (epilogue_thread_idx == 0)
             cute::tma_store_wait<0>();
 
-        // ========== 由warp 1释放张量内存 ==========
-        // 注意：warp 0正在等待TMA存储
         if (epilogue_warp_idx == 1)
             Allocator().free(0, kNumTmemCols);
     }
 
-    // ========== 最终同步 ==========
-    // 为了安全地析构所有屏障，我们需要集群同步
-    // TODO: 通过另一轮屏障等待来优化它
     if constexpr (kNumMulticast > 1)
         cute::cluster_sync();
-// #else
-//     if (blockIdx.x == 0 and threadIdx.x == 0)
-//         DG_DEVICE_ASSERT(false and "This kernel only support sm_100a/sm_101a");
-// #endif
 }
 
 };  // namespace deep_gemm
