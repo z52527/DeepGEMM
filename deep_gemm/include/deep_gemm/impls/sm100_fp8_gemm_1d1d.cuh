@@ -488,33 +488,44 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         tcgen05_before_thread_sync();
                         
                         if (is_last_iter && s == kNumInnerStages - 1) {
-                            // ===== MMA warp (warp 1) TMEM readback verification =====
-                            // Read back from TMEM using the SAME warp that wrote, to confirm data is there.
-                            // If warp 1 reads back 512.0 but epilogue warps read 0, the problem is cross-warp TMEM visibility.
+                            // ===== Warp 1: TMEM → smem_cd copy =====
+                            // TMEM is per-warp: only warp 1 can read its own data.
+                            // Epilogue warps cannot see it, so warp 1 copies to smem_cd directly.
                             tcgen05_after_thread_sync();
+
+                            constexpr uint32_t kBGBytes = 16;
+                            constexpr uint32_t kElemsPerBG = kBGBytes / sizeof(cd_dtype_t);
+                            const uint32_t tma_stage_idx = 0;
+
                             #pragma unroll
                             for (uint32_t rg = 0; rg < kNumMTiles; ++rg) {
-                                uint32_t rb_base = accum_stage_idx * kNumMTiles * BLOCK_N + rg * BLOCK_N;
-                                for (uint32_t ri = 0; ri < BLOCK_N; ri += 4) {
-                                    uint32_t rb_addr = rb_base + ri;
+                                uint32_t tmem_base = accum_stage_idx * kNumMTiles * BLOCK_N + rg * BLOCK_N;
+                                #pragma unroll
+                                for (uint32_t i = 0; i < STORE_BLOCK_N / kElemsPerBG; ++i) {
+                                    uint32_t rb_addr = tmem_base + i * kElemsPerBG;
                                     uint32_t rv0, rv1, rv2, rv3;
                                     asm volatile(
                                         "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
                                         : "=r"(rv0), "=r"(rv1), "=r"(rv2), "=r"(rv3)
-                                        : "r"(rb_addr)
-                                        : "memory"
-                                    );
-                                    if (lane_idx == 0) {
-                                        printf("MMA_READBACK: rg=%u, addr=%u, values=[%f, %f, %f, %f]\n",
-                                               rg, rb_addr,
-                                               *reinterpret_cast<float*>(&rv0),
-                                               *reinterpret_cast<float*>(&rv1),
-                                               *reinterpret_cast<float*>(&rv2),
-                                               *reinterpret_cast<float*>(&rv3));
-                                    }
+                                        : "r"(rb_addr) : "memory");
+                                    cutlass::arch::fence_view_async_tmem_load();
+
+                                    // Swizzled smem_cd layout (same formula as epilogue)
+                                    auto bgi = i + lane_idx * (kSwizzleCDMode / kBGBytes);
+                                    constexpr bool kShortcut = (kSwizzleCDMode / kBGBytes) == 8;
+                                    auto srow = kShortcut ? (i / 8 + lane_idx) : (bgi / 8);
+                                    auto scol = kShortcut ? (i) : (bgi % 8);
+                                    scol ^= srow % (kSwizzleCDMode / 16);
+
+                                    auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                                    rg * 32 * kSwizzleCDMode +
+                                                    srow * (kBGBytes * 8) + scol * kBGBytes;
+                                    st_shared(smem_ptr, rv0, rv1, rv2, rv3);
                                 }
                             }
+
                             tcgen05_before_thread_sync();
+                            cutlass::arch::fence_view_async_shared();
 
                             if (cute::elect_one_sync()) {
                                 tmem_full_barriers[accum_stage_idx]->arrive();
@@ -570,8 +581,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     cute::tma_store_wait<0>();
                 cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
 
+                // smem_cd is already filled by warp 1 (TMEM is per-warp, epilogue can't read it)
                 tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
-                tcgen05_after_thread_sync();
 
                 DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
                 DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
@@ -592,49 +603,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         const auto m_idx = scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * LAYOUT_AD_M;
                         const auto n_idx = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
 
-                        #pragma unroll
-                        for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
-                            auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
-                            constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
-                            auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
-                            auto col = kHasShortcut ? (i) : (bank_group_index % 8);
-                            col ^= row % (kSwizzleCDMode / 16);
-
-                            // TMEM 列基址与 MMA 的对应关系（必须一致，否则读错行）：
-                            // - MMA 侧：row_group=0 写 tmem 列 0..15（M 行 0-31），row_group=1 写列 16-31（M 行 32-63），依次类推。
-                            // - Epilogue：epilogue_warp_idx=0 负责输出 M 行 0-31  → 必须从 tmem 列 0-15 读 → m_block_in_tmem=0；
-                            //   epilogue_warp_idx=1 → 行 32-63 → 列 16-31 → m_block_in_tmem=1；同理 2→32-47，3→48-63。
-                            // 故 m_block_in_tmem = w * kNumRowBlocksPerMWave + epilogue_warp_idx，与 MMA 的 row_group 一一对应。
-                            uint32_t m_block_in_tmem = w * kNumRowBlocksPerMWave + epilogue_warp_idx;
-                            // printf("CUDA CORE: m_block_in_tmem=%u = w * kNumRowBlocksPerMWave + epilogue_warp_idx = %u * %u + %u = %u\n", m_block_in_tmem, w, kNumRowBlocksPerMWave, epilogue_warp_idx, m_block_in_tmem);
-                            uint32_t tmem_addr = accum_stage_idx * kNumMTiles * BLOCK_N + m_block_in_tmem * BLOCK_N + s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
-                            auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
-                                            epilogue_warp_idx * 32 * kSwizzleCDMode +
-                                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
-                            // printf("Copy tmem_addr=%u to tma_stage_idx=%u, epilogue_warp_idx=%u, row=%u, kSwizzleCDMode=%u, col=%u, smem_ptr=%p\n", tmem_addr, tma_stage_idx, epilogue_warp_idx, row, kSwizzleCDMode, col, smem_ptr);
-                            uint32_t values[kNumElemsPerBankGroup];
-                            if constexpr (cute::is_same_v<cd_dtype_t, float>) {
-                                DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
-                                // Raw PTX: same as MMA side (tcgen05.ld), so all 4 epilogue warps can load.
-                                // tmem_addr matches MMA tmem_col layout: accum_stage * kNumMTiles*BLOCK_N + m_block*BLOCK_N + s*STORE_BLOCK_N + i*4.
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(values[0]), "=r"(values[1]), "=r"(values[2]), "=r"(values[3])
-                                    : "r"(tmem_addr)
-                                    : "memory"
-                                );
-                                cutlass::arch::fence_view_async_tmem_load();
-                                st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
-                                // if(tmem_addr == 0&&row==0&&col==0)
-                                printf("CUDA CORE: tmem_addr=%u, row=%u, col=%u, values=[%f, %f, %f, %f]\n", tmem_addr, row, col, *reinterpret_cast<float*>(&values[0]), *reinterpret_cast<float*>(&values[1]), *reinterpret_cast<float*>(&values[2]), *reinterpret_cast<float*>(&values[3]));
-                            } 
-                        }
-
-                        if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
-                            tcgen05_before_thread_sync();
-                            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                        }
-                        __syncwarp();
+                        // TMEM read skipped: smem_cd already written by MMA warp (warp 1)
 
                         cute::tma_store_fence();
                         cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
