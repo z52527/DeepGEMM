@@ -12,6 +12,16 @@ namespace deep_gemm {
 
 using namespace deep_gemm::sm100;
 
+// E2M1 FP4 到 float 的转换函数
+// E2M1 格式: 4 bits = SEEM (S=符号 1bit, E=指数 2bits, M=尾数 1bit)
+__device__ __forceinline__ float fp4_e2m1_to_float(uint32_t fp4_bits) {
+    constexpr float E2M1_LUT[16] = {
+         0.0f,   0.5f,   1.0f,   1.5f,   2.0f,   3.0f,   4.0f,   6.0f,  // 正数 (S=0)
+        -0.0f,  -0.5f,  -1.0f,  -1.5f,  -2.0f,  -3.0f,  -4.0f,  -6.0f   // 负数 (S=1)
+    };
+    return E2M1_LUT[fp4_bits & 0xF];
+}
+
 // SM100 FP4 GEMM 1D1D kernel实现
 // 支持 MXF4 block-scaled 矩阵乘法
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
@@ -55,6 +65,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t UMMA_K_FP4 = 64;
     
     DG_STATIC_ASSERT(BLOCK_M % LAYOUT_AD_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
+    // TMEM 32dp：每列 32 个 depth，故 BLOCK_M 行需 BLOCK_M/32 个“行块”
+    constexpr uint32_t kNumMTiles = BLOCK_M / 32;
+    constexpr uint32_t kNumRowBlocksPerMWave = LAYOUT_AD_M / 32;
 
     // ========== 动态形状处理 ==========
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
@@ -96,8 +109,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // ========== 张量内存配置 ==========
     constexpr uint32_t kNumSFATmemCols = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemCols = SF_BLOCK_N / 32;
-    constexpr uint32_t kNumEpilogueStages = (2 * kNumMWaves * BLOCK_N + kNumSFATmemCols + kNumSFBTmemCols) > 512 ? 1 : 2;
-    constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * kNumMWaves * BLOCK_N;
+    constexpr uint32_t kNumEpilogueStages = (2 * kNumMTiles * BLOCK_N + kNumSFATmemCols + kNumSFBTmemCols) > 512 ? 1 : 2;
+    // 累加区列数：每 stage 存 BLOCK_M 行×BLOCK_N 列，需 kNumMTiles 个行块×BLOCK_N 列
+    constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * kNumMTiles * BLOCK_N;
     constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFATmemCols + kNumSFBTmemCols>();
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
@@ -362,11 +376,111 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                     a_desc.lo = advance_umma_desc_lo<kMajorA, BLOCK_M, kSwizzleAMode, uint32_t>(
                                         a_desc_stage_lo, w * LAYOUT_AD_M * BLOCK_K, k * UMMA_K_INT32);
                                     
-                                    uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
-                                    bool do_accumulate = (k_iter > 0 || s > 0 || k > 0);
+                                    bool do_accumulate = (k_iter > 0 || k > 0 || s > 0);
                                     
-                                    cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate, 
-                                                         runtime_instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                                    // ========== 仍只用 warp 1：每个 lane 算 4 行（row_group 0..3），共 32×4=128 行覆盖整块 ==========
+                                    #pragma unroll
+                                    for (uint32_t row_group = 0; row_group < kNumMTiles; ++row_group) {
+                                        // TMEM 列基址：按行块划分；row_group 对应本轮 32 行 (row_group*32 .. row_group*32+31)
+                                        uint32_t m_block_in_tmem = w * kNumRowBlocksPerMWave + row_group;
+                                        uint32_t tmem_col = accum_stage_idx * kNumMTiles * BLOCK_N + m_block_in_tmem * BLOCK_N + n * UMMA_N;
+                                        // 本 lane 在本轮负责的 M 行
+                                        uint32_t m_row = row_group * 32 + lane_idx;
+                                        
+                                        float acc[16] = {0};
+                                        
+                                        // 从 TMEM 读取（如果需要累加）
+                                        if (do_accumulate) {
+                                            uint32_t r0 = tmem_col + 0u;
+                                            uint32_t r1 = tmem_col + 4u;
+                                            uint32_t r2 = tmem_col + 8u;
+                                            uint32_t r3 = tmem_col + 12u;
+                                            uint32_t v0, v1, v2, v3;
+                                            asm volatile(
+                                                "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+                                                : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                                                : "r"(r0)
+                                                : "memory"
+                                            );
+                                            acc[0] = *reinterpret_cast<float*>(&v0);
+                                            acc[1] = *reinterpret_cast<float*>(&v1);
+                                            acc[2] = *reinterpret_cast<float*>(&v2);
+                                            acc[3] = *reinterpret_cast<float*>(&v3);
+                                            asm volatile(
+                                                "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+                                                : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                                                : "r"(r1)
+                                                : "memory"
+                                            );
+                                            acc[4] = *reinterpret_cast<float*>(&v0);
+                                            acc[5] = *reinterpret_cast<float*>(&v1);
+                                            acc[6] = *reinterpret_cast<float*>(&v2);
+                                            acc[7] = *reinterpret_cast<float*>(&v3);
+                                            asm volatile(
+                                                "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+                                                : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                                                : "r"(r2)
+                                                : "memory"
+                                            );
+                                            acc[8] = *reinterpret_cast<float*>(&v0);
+                                            acc[9] = *reinterpret_cast<float*>(&v1);
+                                            acc[10] = *reinterpret_cast<float*>(&v2);
+                                            acc[11] = *reinterpret_cast<float*>(&v3);
+                                            asm volatile(
+                                                "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+                                                : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                                                : "r"(r3)
+                                                : "memory"
+                                            );
+                                            acc[12] = *reinterpret_cast<float*>(&v0);
+                                            acc[13] = *reinterpret_cast<float*>(&v1);
+                                            acc[14] = *reinterpret_cast<float*>(&v2);
+                                            acc[15] = *reinterpret_cast<float*>(&v3);
+                                        }
+                                        
+                                        // 计算：1 行 M × 16 列 N
+                                        if (m_row < LOAD_BLOCK_M) {
+                                            for (uint32_t n_col = 0; n_col < UMMA_N; ++n_col) {
+                                                for (uint32_t k_offset = 0; k_offset < UMMA_K_INT32; ++k_offset) {
+                                                    uint32_t k_idx = k * UMMA_K_INT32 + k_offset;
+                                                    uint32_t a_packed = smem_a_packed[s][m_row * BLOCK_K + k_idx];
+                                                    uint32_t b_packed = smem_b_packed[s][n_col * BLOCK_K + k_idx];
+                                                    for (int fp4 = 0; fp4 < 8; ++fp4) {
+                                                        uint32_t a_bits = (a_packed >> (fp4 * 4)) & 0xF;
+                                                        uint32_t b_bits = (b_packed >> (fp4 * 4)) & 0xF;
+                                                        acc[n_col] += fp4_e2m1_to_float(a_bits) * fp4_e2m1_to_float(b_bits);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // 写回 TMEM
+                                        uint32_t w0 = tmem_col + 0u;
+                                        uint32_t w1 = tmem_col + 4u;
+                                        uint32_t w2 = tmem_col + 8u;
+                                        uint32_t w3 = tmem_col + 12u;
+                                        // printf("CUDA CORE: w0=%u, w1=%u, w2=%u, w3=%u\n", w0, w1, w2, w3);
+                                        asm volatile(
+                                            "tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1, %2, %3, %4};"
+                                            : : "r"(w0), "r"(*reinterpret_cast<uint32_t*>(&acc[0])), "r"(*reinterpret_cast<uint32_t*>(&acc[1])), "r"(*reinterpret_cast<uint32_t*>(&acc[2])), "r"(*reinterpret_cast<uint32_t*>(&acc[3]))
+                                            : "memory"
+                                        );
+                                        asm volatile(
+                                            "tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1, %2, %3, %4};"
+                                            : : "r"(w1), "r"(*reinterpret_cast<uint32_t*>(&acc[4])), "r"(*reinterpret_cast<uint32_t*>(&acc[5])), "r"(*reinterpret_cast<uint32_t*>(&acc[6])), "r"(*reinterpret_cast<uint32_t*>(&acc[7]))
+                                            : "memory"
+                                        );
+                                        asm volatile(
+                                            "tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1, %2, %3, %4};"
+                                            : : "r"(w2), "r"(*reinterpret_cast<uint32_t*>(&acc[8])), "r"(*reinterpret_cast<uint32_t*>(&acc[9])), "r"(*reinterpret_cast<uint32_t*>(&acc[10])), "r"(*reinterpret_cast<uint32_t*>(&acc[11]))
+                                            : "memory"
+                                        );
+                                        asm volatile(
+                                            "tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1, %2, %3, %4};"
+                                            : : "r"(w3), "r"(*reinterpret_cast<uint32_t*>(&acc[12])), "r"(*reinterpret_cast<uint32_t*>(&acc[13])), "r"(*reinterpret_cast<uint32_t*>(&acc[14])), "r"(*reinterpret_cast<uint32_t*>(&acc[15]))
+                                            : "memory"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -374,6 +488,34 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         tcgen05_before_thread_sync();
                         
                         if (is_last_iter && s == kNumInnerStages - 1) {
+                            // ===== MMA warp (warp 1) TMEM readback verification =====
+                            // Read back from TMEM using the SAME warp that wrote, to confirm data is there.
+                            // If warp 1 reads back 512.0 but epilogue warps read 0, the problem is cross-warp TMEM visibility.
+                            tcgen05_after_thread_sync();
+                            #pragma unroll
+                            for (uint32_t rg = 0; rg < kNumMTiles; ++rg) {
+                                uint32_t rb_base = accum_stage_idx * kNumMTiles * BLOCK_N + rg * BLOCK_N;
+                                for (uint32_t ri = 0; ri < BLOCK_N; ri += 4) {
+                                    uint32_t rb_addr = rb_base + ri;
+                                    uint32_t rv0, rv1, rv2, rv3;
+                                    asm volatile(
+                                        "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+                                        : "=r"(rv0), "=r"(rv1), "=r"(rv2), "=r"(rv3)
+                                        : "r"(rb_addr)
+                                        : "memory"
+                                    );
+                                    if (lane_idx == 0) {
+                                        printf("MMA_READBACK: rg=%u, addr=%u, values=[%f, %f, %f, %f]\n",
+                                               rg, rb_addr,
+                                               *reinterpret_cast<float*>(&rv0),
+                                               *reinterpret_cast<float*>(&rv1),
+                                               *reinterpret_cast<float*>(&rv2),
+                                               *reinterpret_cast<float*>(&rv3));
+                                    }
+                                }
+                            }
+                            tcgen05_before_thread_sync();
+
                             if (cute::elect_one_sync()) {
                                 tmem_full_barriers[accum_stage_idx]->arrive();
                             }
@@ -458,17 +600,33 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             auto col = kHasShortcut ? (i) : (bank_group_index % 8);
                             col ^= row % (kSwizzleCDMode / 16);
 
-                            uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
+                            // TMEM 列基址与 MMA 的对应关系（必须一致，否则读错行）：
+                            // - MMA 侧：row_group=0 写 tmem 列 0..15（M 行 0-31），row_group=1 写列 16-31（M 行 32-63），依次类推。
+                            // - Epilogue：epilogue_warp_idx=0 负责输出 M 行 0-31  → 必须从 tmem 列 0-15 读 → m_block_in_tmem=0；
+                            //   epilogue_warp_idx=1 → 行 32-63 → 列 16-31 → m_block_in_tmem=1；同理 2→32-47，3→48-63。
+                            // 故 m_block_in_tmem = w * kNumRowBlocksPerMWave + epilogue_warp_idx，与 MMA 的 row_group 一一对应。
+                            uint32_t m_block_in_tmem = w * kNumRowBlocksPerMWave + epilogue_warp_idx;
+                            // printf("CUDA CORE: m_block_in_tmem=%u = w * kNumRowBlocksPerMWave + epilogue_warp_idx = %u * %u + %u = %u\n", m_block_in_tmem, w, kNumRowBlocksPerMWave, epilogue_warp_idx, m_block_in_tmem);
+                            uint32_t tmem_addr = accum_stage_idx * kNumMTiles * BLOCK_N + m_block_in_tmem * BLOCK_N + s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;
                             auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
                                             epilogue_warp_idx * 32 * kSwizzleCDMode +
                                             row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
-
+                            // printf("Copy tmem_addr=%u to tma_stage_idx=%u, epilogue_warp_idx=%u, row=%u, kSwizzleCDMode=%u, col=%u, smem_ptr=%p\n", tmem_addr, tma_stage_idx, epilogue_warp_idx, row, kSwizzleCDMode, col, smem_ptr);
                             uint32_t values[kNumElemsPerBankGroup];
                             if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                                 DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
-                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
+                                // Raw PTX: same as MMA side (tcgen05.ld), so all 4 epilogue warps can load.
+                                // tmem_addr matches MMA tmem_col layout: accum_stage * kNumMTiles*BLOCK_N + m_block*BLOCK_N + s*STORE_BLOCK_N + i*4.
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+                                    : "=r"(values[0]), "=r"(values[1]), "=r"(values[2]), "=r"(values[3])
+                                    : "r"(tmem_addr)
+                                    : "memory"
+                                );
                                 cutlass::arch::fence_view_async_tmem_load();
                                 st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                                // if(tmem_addr == 0&&row==0&&col==0)
+                                printf("CUDA CORE: tmem_addr=%u, row=%u, col=%u, values=[%f, %f, %f, %f]\n", tmem_addr, row, col, *reinterpret_cast<float*>(&values[0]), *reinterpret_cast<float*>(&values[1]), *reinterpret_cast<float*>(&values[2]), *reinterpret_cast<float*>(&values[3]));
                             } 
                         }
 

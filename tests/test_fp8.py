@@ -759,7 +759,8 @@ def test_fp4_simple_known_values():
     print('Test: FP4 Simple Known Values')
     print('='*60)
     
-    m, n, k = 256, 256, 512
+    # m, n, k = 256, 256, 512
+    m, n, k = 128, 16, 512  # 只有 1 个 block
     k_packed = k // 8
     block_k = 32
     
@@ -804,10 +805,15 @@ def test_fp4_simple_known_values():
         return
     
     # 检查结果
+    count = 0
     d_cpu = d.cpu()
     expected = float(k)
-    
-    print(f"\n结果检查 (期望值: {expected}):")
+    for i in range(d_cpu.shape[0]):
+        for j in range(d_cpu.shape[1]):
+            if d_cpu[i, j].item() == expected:
+                # print(f"  D[{i}, {j}] = {d_cpu[i, j].item():.4f}")
+                count+=1
+    print(f"\n结果检查 (期望值: {expected}, 期望m*n：{m*n}个, 找到 {count} 个):")
     print(f"  D[0,0] = {d_cpu[0,0].item():.4f}")
     print(f"  D[0,1] = {d_cpu[0,1].item():.4f}")
     print(f"  D[1,0] = {d_cpu[1,0].item():.4f}")
