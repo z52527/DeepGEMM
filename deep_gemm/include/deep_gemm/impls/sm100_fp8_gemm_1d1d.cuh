@@ -22,6 +22,22 @@ __device__ __forceinline__ float fp4_e2m1_to_float(uint32_t fp4_bits) {
     return E2M1_LUT[fp4_bits & 0xF];
 }
 
+// Swizzle-aware shared memory index for reading TMA-loaded data.
+// TMA stores data with bank-group XOR swizzle: physical_bank = logical_bank ^ (row % num_banks).
+// swizzle_mode: kSwizzleAMode or kSwizzleBMode (bytes, e.g. 128)
+// row: M or N row index, k: K column index, block_k: elements per row
+template <uint32_t swizzle_mode>
+__device__ __forceinline__ uint32_t swizzled_smem_k_major_idx(uint32_t row, uint32_t k, uint32_t block_k) {
+    constexpr uint32_t kElemBytes = sizeof(uint32_t);
+    constexpr uint32_t kBankBytes = 16;
+    constexpr uint32_t kElemsPerBank = kBankBytes / kElemBytes;            // 4
+    constexpr uint32_t kNumBanks = swizzle_mode / kBankBytes;             // e.g. 8 for 128B
+    uint32_t bank = k / kElemsPerBank;
+    uint32_t in_bank = k % kElemsPerBank;
+    uint32_t swizzled_bank = bank ^ (row % kNumBanks);
+    return row * block_k + swizzled_bank * kElemsPerBank + in_bank;
+}
+
 // SM100 FP4 GEMM 1D1D kernel实现
 // 支持 MXF4 block-scaled 矩阵乘法
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
@@ -438,13 +454,13 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                             acc[15] = *reinterpret_cast<float*>(&v3);
                                         }
                                         
-                                        // 计算：1 行 M × 16 列 N
+                                        // 计算：1 行 M × UMMA_N 列 N（swizzle-aware smem read）
                                         if (m_row < LOAD_BLOCK_M) {
                                             for (uint32_t n_col = 0; n_col < UMMA_N; ++n_col) {
                                                 for (uint32_t k_offset = 0; k_offset < UMMA_K_INT32; ++k_offset) {
                                                     uint32_t k_idx = k * UMMA_K_INT32 + k_offset;
-                                                    uint32_t a_packed = smem_a_packed[s][m_row * BLOCK_K + k_idx];
-                                                    uint32_t b_packed = smem_b_packed[s][n_col * BLOCK_K + k_idx];
+                                                    uint32_t a_packed = smem_a_packed[s][swizzled_smem_k_major_idx<kSwizzleAMode>(m_row, k_idx, BLOCK_K)];
+                                                    uint32_t b_packed = smem_b_packed[s][swizzled_smem_k_major_idx<kSwizzleBMode>(n_col, k_idx, BLOCK_K)];
                                                     for (int fp4 = 0; fp4 < 8; ++fp4) {
                                                         uint32_t a_bits = (a_packed >> (fp4 * 4)) & 0xF;
                                                         uint32_t b_bits = (b_packed >> (fp4 * 4)) & 0xF;
