@@ -934,10 +934,10 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     # 简单测试：用已知值验证 kernel
-    # test_fp4_simple_known_values()
+    test_fp4_simple_known_values()
     
     # 测试 E2M1 FP4 GEMM（
-    test_fp4_e2m1_gemm()
+    # test_fp4_e2m1_gemm()
     
     # 测试单个tile的FP4 GEMM（
     # test_gemm_single_tile()
