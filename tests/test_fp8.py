@@ -719,11 +719,9 @@ def generate_mxf4_scale_factors(m, n, k_fp4, device='cuda'):
     """
     from deep_gemm.utils import ceil_div
     
-    k_int32 = k_fp4 // 8
-    # gran_k = 128 bytes = 32 int32 elements
-    # 但 sf_k 必须是 4 的倍数，以确保 UE8M0 打包时所有字节都是 0x7F
-    sf_k_raw = ceil_div(k_int32, 32)
-    sf_k = ((sf_k_raw + 3) // 4) * 4  # 向上取整到 4 的倍数
+    MXF4_VS = 32
+    sf_k_raw = k_fp4 // MXF4_VS
+    sf_k = ((sf_k_raw + 3) // 4) * 4
     
     # 生成 float32 的 1.0，会被 transform 函数转换为 UE8M0
     # float32 的 1.0 = 0x3f800000
@@ -731,14 +729,8 @@ def generate_mxf4_scale_factors(m, n, k_fp4, device='cuda'):
     sf_a = torch.ones((m, sf_k), dtype=torch.float32, device=device)
     sf_b = torch.ones((n, sf_k), dtype=torch.float32, device=device)
     
-    print(f"  [MXF4 SF] Generated float32 scale factors:")
-    print(f"    k_fp4 = {k_fp4} (FP4 elements)")
-    print(f"    k_int32 = {k_int32} (int32 elements)")
-    print(f"    sf_k_raw = ceil_div({k_int32}, 32) = {sf_k_raw}")
-    print(f"    sf_k = aligned to 4: {sf_k}")
-    print(f"    sf_a shape: {sf_a.shape}")
-    print(f"    sf_b shape: {sf_b.shape}")
-    print(f"    SF value: 1.0 (will be converted to packed UE8M0 0x7F7F7F7F)")
+    print(f"  [MXF4 SF] VS={MXF4_VS}, sf_k_raw={sf_k_raw}, sf_k={sf_k}")
+    print(f"    sf_a={sf_a.shape}, sf_b={sf_b.shape}")
     
     return sf_a, sf_b
 
@@ -760,7 +752,8 @@ def test_fp4_simple_known_values():
     print('='*60)
     
     # m, n, k = 256, 256, 512
-    m, n, k = 128, 16, 512  # 只有 1 个 block
+    m, n, k = 128, 16, 256  # 只有 1 个 block
+    # m, n, k = 128, 16, 2048 # 只有 1 个 block
     k_packed = k // 8
     block_k = 32
     
@@ -773,6 +766,7 @@ def test_fp4_simple_known_values():
     # 打包 8 个 1.0：每个 nibble 是 0b0010
     # int32 = 0x22222222
     fp4_one_packed = 0x22222222  # 8 个 E2M1 的 1.0
+    # fp4_one_packed = 0x44444444  # 8 个 E2M1 的 2.0
     
     print(f"Creating packed tensors with FP4 value 1.0 (E2M1 bits = 0b0010)")
     print(f"Packed int32 = 0x{fp4_one_packed:08x}")
@@ -848,7 +842,8 @@ def test_fp4_e2m1_gemm():
     print('='*60)
     
     # 配置
-    m, n, k = 256, 256, 512
+    # m, n, k = 256, 256, 512
+    m, n, k = 128, 16, 64
     k_packed = k // 8
     block_k = 32  # kernel 中的 BLOCK_K（int32 单位）
     
@@ -935,7 +930,7 @@ if __name__ == '__main__':
 
     # 简单测试：用已知值验证 kernel
     test_fp4_simple_known_values()
-    
+
     # 测试 E2M1 FP4 GEMM（
     # test_fp4_e2m1_gemm()
     

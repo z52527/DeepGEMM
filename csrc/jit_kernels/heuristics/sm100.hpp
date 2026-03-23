@@ -69,7 +69,8 @@ struct SM100ArchSpec {
             const auto& [sf_block_m_, sf_block_n_] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
             sf_block_m = sf_block_m_, sf_block_n = sf_block_n_;
         }
-        if (((2 * block_n) + (sf_block_m / 32) + (sf_block_n / 32)) > 512)
+        const int sf_tmem_k_mult = (ab_dtype == torch::kInt) ? 2 : 1;
+        if (((2 * block_n) + (sf_block_m / 32) * sf_tmem_k_mult + (sf_block_n / 32) * sf_tmem_k_mult) > 512)
             return false;
 
         // NOTES: when B is MN-major, we restrict `block_n` to multiples of 64,
@@ -120,8 +121,9 @@ struct SM100ArchSpec {
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
-            smem_sfa_per_stage = sf_block_m * 4;
-            smem_sfb_per_stage = sf_block_n * 4;
+            const int sf_packed_k_per_stage = (ab_dtype == torch::kInt) ? 2 : 1;
+            smem_sfa_per_stage = sf_block_m * 4 * sf_packed_k_per_stage;
+            smem_sfb_per_stage = sf_block_n * 4 * sf_packed_k_per_stage;
         } else {
             smem_sfa_per_stage = block_m * 4;
             smem_sfb_per_stage = 0;
