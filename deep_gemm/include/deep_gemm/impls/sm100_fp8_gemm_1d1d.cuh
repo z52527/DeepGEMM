@@ -477,8 +477,25 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                     uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
                                     bool do_accumulate = (k_iter > 0 || s > 0 || k > 0);
                                     
-                                    cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate,
-                                                         runtime_instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                                    // cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate,
+                                    //                      runtime_instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                                    if (cute::elect_one_sync()) {
+                                        uint64_t desc_a_raw = static_cast<uint64_t>(a_desc);
+                                        uint64_t desc_b_raw = static_cast<uint64_t>(b_desc);
+                                        uint32_t idesc_hi = static_cast<uint32_t>(runtime_instr_desc_mxf4 >> 32);
+                                        uint32_t acc = do_accumulate ? 1u : 0u;
+                                        asm volatile(
+                                            "{\n\t"
+                                            ".reg .pred p;\n\t"
+                                            "setp.ne.b32 p, %4, 0;\n\t"
+                                            "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.block32 "
+                                            "[%0], %1, %2, %3, [%5], [%6], p; \n\t"
+                                            "}\n"
+                                            :
+                                            : "r"(tmem_col), "l"(desc_a_raw), "l"(desc_b_raw),
+                                              "r"(idesc_hi), "r"(acc),
+                                              "r"(tmem_sfa_addr), "r"(tmem_sfb_addr));
+                                    }
                                 }
                             }
                         }
