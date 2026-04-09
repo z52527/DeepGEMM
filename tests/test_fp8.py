@@ -752,8 +752,10 @@ def test_fp4_simple_known_values():
     print('='*60)
     
     # m, n, k = 256, 256, 512
-    m, n, k = 128, 16, 256  # 只有 1 个 block
-    # m, n, k = 128, 16, 2048 # 只有 1 个 block
+    # NOTE: K here is FP4-element count along the contraction. k_packed = k//8 int32 columns.
+    # Shapes too small (e.g. k=16 -> 2 int32) break TMA (block_k=32 int32) with CUDA_ERROR_INVALID_VALUE.
+    # m, n, k = 256, 128, 32  # 已经正确 one full tile with SM100 block_k=32 int32
+    m, n, k = 32, 64, 128 # 只有 1 个 block
     k_packed = k // 8
     block_k = 32
     
@@ -785,7 +787,9 @@ def test_fp4_simple_known_values():
     
     print(f"\nConfig: M={m}, N={n}, K={k}, K_packed={k_packed}")
     print(f"Expected result: C[i,j] = {k} × 1.0 × 1.0 = {k}.0")
-    
+    # debug message m, n, k = 32, 64, 128
+    print(f"a_packed.shape = {a_packed.shape}")  # 期望 (32, 16)
+    print(f"k passed to kernel = {k_packed}")     # 应该是 16 (int32个数)
     # 运行 kernel
     print("\nRunning kernel...")
     try:
@@ -821,6 +825,9 @@ def test_fp4_simple_known_values():
     all_correct = torch.allclose(d_cpu, torch.full_like(d_cpu, expected), atol=1e-2)
     print(f"\n  所有值都正确: {all_correct}")
     
+    ok = (d_cpu == expected)
+    print("每列正确个数:", ok.sum(dim=0).tolist())
+    print("每行正确个数:", ok.sum(dim=1).tolist())
     if not all_correct:
         # 找出错误的位置
         diff = torch.abs(d_cpu - expected)
@@ -843,7 +850,11 @@ def test_fp4_e2m1_gemm():
     
     # 配置
     # m, n, k = 256, 256, 512
-    m, n, k = 128, 16, 64
+    # m, n, k = 128, 16, 64
+    # m, n, k = 32, 64, 32 #correct
+    # m, n, k = 128, 256, 64 #correct
+    m, n, k = 128, 256, 128 #correct
+    # m, n, k = 32, 64, 32
     k_packed = k // 8
     block_k = 32  # kernel 中的 BLOCK_K（int32 单位）
     
@@ -932,7 +943,7 @@ if __name__ == '__main__':
     test_fp4_simple_known_values()
 
     # 测试 E2M1 FP4 GEMM（
-    # test_fp4_e2m1_gemm()
+    test_fp4_e2m1_gemm()
     
     # 测试单个tile的FP4 GEMM（
     # test_gemm_single_tile()
