@@ -939,17 +939,13 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    # 简单测试：用已知值验证 kernel
-    test_fp4_simple_known_values()
-
-    # 测试 E2M1 FP4 GEMM（
-    test_fp4_e2m1_gemm()
-    
-    # 测试单个tile的FP4 GEMM（
-    # test_gemm_single_tile()
-    
-    # 原来的测试（暂时注释）
+    # FP4 测试已移至 test_fp4.py，运行: python tests/test_fp4.py
+    # 以下是原始 FP8 测试（FP4 开发期间暂时注释）
     # test_gemm()
     # test_m_grouped_gemm_contiguous()
     # test_m_grouped_gemm_masked()
     # test_k_grouped_gemm_contiguous()
+
+    # FP4 快速验证（保留以便快速 smoke test）
+    test_fp4_simple_known_values()
+    test_fp4_e2m1_gemm()
