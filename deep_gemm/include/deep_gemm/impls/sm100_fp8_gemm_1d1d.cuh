@@ -307,6 +307,11 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         DG_STATIC_ASSERT(UMMA_M == 128, "MXF4 requires M=128");
         DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256), "Invalid MXF4 N-mode size");
 
+        // UTCCP type for SMEM→TMEM SF copy (same as original FP8)
+        using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
+            cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
+        auto sf_desc = make_sf_desc(nullptr);
+
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
@@ -428,33 +433,34 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         }
 
                         with_sf_full_barriers[s]->wait(phase);
-                    // A/B SMEM debug disabled
-                        // SF复制到TMEM (SF_PACKED_K_PER_STAGE packed groups per stage)
-                        const uint32_t sfa_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
-                        const uint32_t sfb_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFBStagesPerLoad;
-                        // SF TMEM setup: only on first iteration (k_iter=0, s=0) to avoid
-                        // destroying accumulated results from previous K iterations.
-                        if (k_iter == 0 && s == 0) {
-                            // Zero accumulator region so first MMA (do_accumulate=false) starts clean
-                            #pragma unroll
-                            for (uint32_t c = 0; c < kNumAccumTmemCols; ++c) {
-                                cute::SM100_TMEM_STORE_32dp32b4x::copy(0u, 0u, 0u, 0u, c);
-                            }
-                            // Fill SF region with SF=1.0
-                            const uint32_t pat = pack_ue8m0_2x_scale_factor_one_word();
-                            constexpr uint32_t kSFStart = kTmemStartColOfSFA;
-                            #pragma unroll
-                            for (uint32_t c = kSFStart; c < kNumTmemCols; ++c) {
-                                cute::SM100_TMEM_STORE_32dp32b4x::copy(pat, pat, pat, pat, c);
-                            }
-                            cutlass::arch::fence_view_async_tmem_store();
-                        }
-                        __syncwarp();
+                        tcgen05_after_thread_sync();
 
-                        // ===== MMA: only warp 1 issues tcgen05.mma (per CUTLASS reference & original FP8 kernel) =====
-                        // tcgen05.mma.cta_group::1 must be issued by exactly 1 warp; the hardware
-                        // internally dispatches across the CTA's warps to produce the full 128-row result.
+                        // ===== MMA warp (warp 1): UTCCP SF copy + MMA =====
+                        // tcgen05.cp (UTCCP) is a CTA-level op — must be issued by exactly 1 thread.
+                        // Placing it in the same warp as MMA ensures async-proxy ordering (cp before mma).
                         if (warp_idx == 1) {
+                            // UTCCP: copy SF from SMEM → TMEM (only on first stage to avoid interfering with accumulation)
+                            if (k_iter == 0 and s == 0 and cute::elect_one_sync()) {
+                                #pragma unroll
+                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                                        replace_smem_desc_addr(sf_desc, smem_sfa[s] + pk * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
+                                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + pk * (SF_BLOCK_M / 32) + i * 4);
+                                    }
+                                }
+                                #pragma unroll
+                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                        replace_smem_desc_addr(sf_desc, smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + pk * (SF_BLOCK_N / 32) + i * 4);
+                                    }
+                                }
+                            }
+                            __syncwarp();
+
+                            // --- MMA loop ---
                             constexpr uint32_t SMEM_A_SIZE_PER_STAGE_PACKED =
                                 LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t);
                             constexpr uint32_t SMEM_B_SIZE_PER_STAGE_PACKED =
@@ -472,6 +478,10 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             uint32_t b_desc_stage_lo =
                                 b_desc_base.lo + s * (SMEM_B_SIZE_PER_STAGE_PACKED / 16);
 
+                            // TODO: Per-k SF addressing for non-uniform scale factors.
+                            // Current: same TMEM SF address for all k steps within a stage.
+                            // This is correct when all SF groups have the same value (uniform SF).
+                            // For per-group random SF, need to change TMEM address + sf_id per k step.
                             uint32_t tmem_sfa_addr = kTmemStartColOfSFA;
                             uint32_t tmem_sfb_addr = kTmemStartColOfSFB;
                             const auto runtime_instr_desc_mxf4 = cute::UMMA::make_runtime_instr_desc_block_scaled(
