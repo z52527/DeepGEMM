@@ -91,7 +91,9 @@ struct SM100ArchSpec {
     static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type,
                                                       const int& m, const int& n, const int& block_m, const int& block_n,
                                                       const int& num_sms) {
-        // TODO: support other layouts
+        // B-multicast: FP8 supports it (UMMA_M=256 ok for MXF8).
+        // FP4 doesn't reach here (dispatched to sm100_fp4_gemm_1d1d which uses its own config with torch::kInt).
+        // A-multicast: blocked by kernel static assert.
         return {
             false,
             is_multicast_legal(m, block_m, 2, num_sms, true) and (gemm_type == GemmType::Normal or gemm_type == GemmType::KGroupedContiguous),
