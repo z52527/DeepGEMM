@@ -140,10 +140,15 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(cd.stride(-2)), 1,
                                                 config.smem_config.swizzle_cd_mode);
+    // For FP4: VS=32 FP4 elements = 4 int32 per scale group.
+    // make_tma_sf_desc uses ceil_div(shape_k, sf_block_k * 4) for SF K dim.
+    // FP8: sf_block_k = block_k = 128 (VS=128), works: ceil_div(K, 512).
+    // FP4: sf_block_k must be VS_in_int32 = 4, so: ceil_div(K_int32, 16) = correct packed cols.
+    const int sf_block_k = is_fp4_packed ? 4 : config.block_k;
     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                  config.block_m, config.block_k, 1, 0);
+                                                  config.block_m, sf_block_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                  config.block_n, config.block_k, 1, 0);
+                                                  config.block_n, sf_block_k, 1, 0);
 
     // Duplicate the accumulator if necessary
     if (c.has_value()) {

@@ -436,11 +436,11 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         tcgen05_after_thread_sync();
 
                         // ===== MMA warp (warp 1): UTCCP SF copy + MMA =====
-                        // tcgen05.cp (UTCCP) is a CTA-level op — must be issued by exactly 1 thread.
-                        // Placing it in the same warp as MMA ensures async-proxy ordering (cp before mma).
                         if (warp_idx == 1) {
-                            // UTCCP: copy SF from SMEM → TMEM (only on first stage to avoid interfering with accumulation)
-                            if (k_iter == 0 and s == 0 and cute::elect_one_sync()) {
+                            // UTCCP: copy SF from SMEM → TMEM at every SF load boundary
+                            // For per-group random SF, each stage needs fresh SF data in TMEM.
+                            const uint32_t sfa_copy_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
+                            if (sfa_copy_stage == 0 and cute::elect_one_sync()) {
                                 #pragma unroll
                                 for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
                                     #pragma unroll
@@ -478,17 +478,25 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             uint32_t b_desc_stage_lo =
                                 b_desc_base.lo + s * (SMEM_B_SIZE_PER_STAGE_PACKED / 16);
 
-                            // TODO: Per-k SF addressing for non-uniform scale factors.
-                            // Current: same TMEM SF address for all k steps within a stage.
-                            // This is correct when all SF groups have the same value (uniform SF).
-                            // For per-group random SF, need to change TMEM address + sf_id per k step.
-                            uint32_t tmem_sfa_addr = kTmemStartColOfSFA;
-                            uint32_t tmem_sfb_addr = kTmemStartColOfSFB;
-                            const auto runtime_instr_desc_mxf4 = cute::UMMA::make_runtime_instr_desc_block_scaled(
-                                instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                            // Per-k SF addressing for MXF4 block-scaled MMA.
+                            // Each UMMA step processes UMMA_K_FP4 = 64 FP4 = 2 groups of VS=32.
+                            // 4 UE8M0 packed per uint32 in TMEM → 2 UMMA steps exhaust one packed group.
+                            // sf_id (2-bit) selects the starting byte within the packed uint32.
+                            constexpr uint32_t kGroupsPerUmmaStep = UMMA_K_FP4 / MXF4_VS;            // 2
+                            constexpr uint32_t kGroupsPerPacked = 4;
+                            constexpr uint32_t kUmmaStepsPerPacked = kGroupsPerPacked / kGroupsPerUmmaStep; // 2
+                            constexpr uint32_t kSfaColsPerPackedGroup = SF_BLOCK_M / 32;
+                            constexpr uint32_t kSfbColsPerPackedGroup = SF_BLOCK_N / 32;
 
                             #pragma unroll
                             for (uint32_t k = 0; k < NUM_K_ITERS_PER_STAGE; ++k) {
+                                uint32_t packed_group = k / kUmmaStepsPerPacked;
+                                uint32_t sf_id = (k % kUmmaStepsPerPacked) * kGroupsPerUmmaStep;  // 0, 2, 0, 2
+
+                                uint32_t tmem_sfa_base = kTmemStartColOfSFA + packed_group * kSfaColsPerPackedGroup;
+                                uint32_t tmem_sfb_k    = kTmemStartColOfSFB + packed_group * kSfbColsPerPackedGroup;
+                                const auto runtime_desc_k = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, sf_id);
+
                                 #pragma unroll
                                 for (uint32_t n = 0; n < NUM_N_ITERS; ++n) {
                                     auto b_desc = b_desc_base;
@@ -510,8 +518,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                         uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
                                         bool do_accumulate = (k_iter > 0 || s > 0 || k > 0);
 
+                                        uint32_t tmem_sfa_k = tmem_sfa_base + w * (kNumUTCCPAlignedElems / 32);
                                         cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate,
-                                                             runtime_instr_desc_mxf4, tmem_sfa_addr, tmem_sfb_addr);
+                                                             runtime_desc_k, tmem_sfa_k, tmem_sfb_k);
                                     }
                                 }
                             }

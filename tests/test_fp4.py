@@ -266,6 +266,11 @@ def test_random_sf():
         (128, 128, 256),
         (128, 256, 256),
         (256, 256, 512),
+        (128, 128, 512),
+        (128, 128, 1024),
+        (256, 128, 256),
+        (256, 256, 1024),
+        (128, 256, 1024),
     ]
     all_pass = True
     for m, n, k in configs:
@@ -296,8 +301,7 @@ if __name__ == '__main__':
         ('sweep',          test_value_sweep()),
         ('asymmetric',     test_asymmetric_values()),
         ('uniform_sf',     test_uniform_sf()),
-        # TODO: random_sf needs per-k SF TMEM addressing (sf_id + TMEM col per k step)
-        # ('random_sf',    test_random_sf()),
+        ('random_sf',    test_random_sf()),
     ]
 
     print()
