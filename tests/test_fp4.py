@@ -7,10 +7,6 @@ Usage:
 
 import torch
 import random
-import os
-
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
 import deep_gemm
 from generators import KernelType, get_ue8m0_usage
 
