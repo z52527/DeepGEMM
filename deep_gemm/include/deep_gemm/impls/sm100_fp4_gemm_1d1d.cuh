@@ -315,8 +315,11 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
-                tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
-                tcgen05_after_thread_sync();
+                // Only the MMA warp needs to wait for the epilogue to finish reading TMEM
+                if (warp_idx == 1) {
+                    tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+                    tcgen05_after_thread_sync();
+                }
 
                 auto empty_barrier_arrive = [&](uint32_t s, bool do_tmem_full_arrive) {
                     auto umma_arrive = [](const uint64_t* barrier) {
@@ -432,8 +435,12 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                             with_sf_full_barriers[s]->arrive(0u);
                         }
 
-                        with_sf_full_barriers[s]->wait(phase);
-                        tcgen05_after_thread_sync();
+                        // TMA warp (3) skips this wait to enable pipeline overlap:
+                        // it can start TMA for stage s+1 while MMA processes stage s.
+                        if (warp_idx != 3) {
+                            with_sf_full_barriers[s]->wait(phase);
+                            tcgen05_after_thread_sync();
+                        }
 
                         // ===== MMA warp (warp 1): UTCCP SF copy + MMA =====
                         if (warp_idx == 1) {
@@ -488,14 +495,17 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                             constexpr uint32_t kSfaColsPerPackedGroup = SF_BLOCK_M / 32;
                             constexpr uint32_t kSfbColsPerPackedGroup = SF_BLOCK_N / 32;
 
+                            // Pre-compute the two runtime descriptors (sf_id alternates 0, 2, 0, 2)
+                            const auto runtime_desc_sf0 = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, 0);
+                            const auto runtime_desc_sf2 = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, kGroupsPerUmmaStep);
+
                             #pragma unroll
                             for (uint32_t k = 0; k < NUM_K_ITERS_PER_STAGE; ++k) {
                                 uint32_t packed_group = k / kUmmaStepsPerPacked;
-                                uint32_t sf_id = (k % kUmmaStepsPerPacked) * kGroupsPerUmmaStep;  // 0, 2, 0, 2
 
                                 uint32_t tmem_sfa_base = kTmemStartColOfSFA + packed_group * kSfaColsPerPackedGroup;
                                 uint32_t tmem_sfb_k    = kTmemStartColOfSFB + packed_group * kSfbColsPerPackedGroup;
-                                const auto runtime_desc_k = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, sf_id);
+                                const auto& runtime_desc_k = (k % kUmmaStepsPerPacked == 0) ? runtime_desc_sf0 : runtime_desc_sf2;
 
                                 #pragma unroll
                                 for (uint32_t n = 0; n < NUM_N_ITERS; ++n) {
@@ -544,7 +554,9 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                             full_barriers[s]->wait(phase);
                             with_sf_full_barriers[s]->arrive(0u);
                         }
-                        with_sf_full_barriers[s]->wait(phase);
+                        if (warp_idx != 3) {
+                            with_sf_full_barriers[s]->wait(phase);
+                        }
                         if (warp_idx == 1) {
                             empty_barrier_arrive(s, false);
                         }

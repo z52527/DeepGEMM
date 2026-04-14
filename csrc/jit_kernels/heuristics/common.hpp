@@ -213,6 +213,12 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     }
     DG_HOST_ASSERT(best_block_m > 0 and best_block_n > 0);
 
+    // Allow overriding block_n via env var for benchmarking/testing
+    if (const auto env_bn = get_env<int>("DG_FP4_BLOCK_N"); env_bn > 0 and ab_dtype == torch::kInt) {
+        DG_HOST_ASSERT(env_bn % 16 == 0 and env_bn <= 256);
+        best_block_n = env_bn;
+    }
+
     // Decide the number of TMA multicasts and whether broadcast on A
     MulticastConfig best_multicast_config = {1, true};
     const auto& [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
