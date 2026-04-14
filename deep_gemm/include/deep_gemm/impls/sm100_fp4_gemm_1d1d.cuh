@@ -255,12 +255,223 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         accum_stage_idx == 0 ? func(0) : func(1);
     };
 
-    // ========== Warp角色分发 ==========
-    // UMMA M=128: four 32-row D bands map to issuing warp_id % 4. Four MMA warps (0–3) are required
-    // for a full 128-row accum. TMA (warp 3) + UTCCP (warp 2) + MMA (warps 0–3) share one
-    // launch_k_iterations so warp 3 is not stuck in a TMA-only while before MMA can run.
-    if (((warp_idx < 3) and is_leader_cta) or (warp_idx == 3)) {
-        // ========== UTCCP helpers (warp 2; same as former dedicated warp-2 path) ==========
+    // ========== Warp dispatch (FP8-style: independent loops per warp) ==========
+    // Warp 0: TMA load producer
+    // Warp 1: MMA consumer (+ UTCCP SF copy to TMEM)
+    // Warp 2: SF transpose (SMEM warp transpose for UTCCP)
+    // Warp 3+: Epilogue
+
+    if (warp_idx == 0) {
+        // ========== Warp 0: TMA load ==========
+        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
+                const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
+
+                #pragma unroll
+                for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
+                    empty_barriers[s]->wait(phase ^ 1);
+
+                    uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx);
+                    uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), KGroupedIndexType::MN>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
+
+                    DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous or kMajorA == cute::UMMA::Major::K, "Invalid major");
+                    uint32_t k_block_idx = k_iter * kNumStages + s;
+                    uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), KGroupedIndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                    uint32_t k_b_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::MN), KGroupedIndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
+
+                    if constexpr (kNumMulticast > 1) {
+                        m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * LOAD_BLOCK_M) : 0;
+                        n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
+                    }
+
+                    if (cute::elect_one_sync()) {
+                        if constexpr (kMajorA == cute::UMMA::Major::K)
+                            tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], k_a_idx, m_idx);
+                        if constexpr (kMajorA == cute::UMMA::Major::MN)
+                            tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], m_idx, k_a_idx);
+                        if constexpr (kMajorB == cute::UMMA::Major::K)
+                            tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b_packed[s], k_b_idx, n_idx);
+                        if constexpr (kMajorB == cute::UMMA::Major::MN)
+                            tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b_packed[s], n_idx, k_b_idx);
+                    }
+                    auto num_arrival_bytes = SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE;
+
+                    const uint32_t sfa_tma_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
+                    if (sfa_tma_stage == 0 and cute::elect_one_sync()) {
+                        uint32_t sf_k_base = k_block_idx / kNumSFAStagesPerLoad * SF_PACKED_K_PER_STAGE;
+                        #pragma unroll
+                        for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                            tma_copy<BLOCK_M, 1, 0, 1>(&tensor_map_sfa, full_barriers[s], smem_sfa[s] + pk * SF_BLOCK_M, m_block_idx * BLOCK_M,
+                                                       scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::SF_K>(shape_sfa_k, 1, sf_k_base + pk));
+                        }
+                        num_arrival_bytes += BLOCK_M * SF_PACKED_K_PER_STAGE * sizeof(uint32_t);
+                    }
+                    const uint32_t sfb_tma_stage = (k_iter * kNumStages + s) % kNumSFBStagesPerLoad;
+                    if (sfb_tma_stage == 0 and cute::elect_one_sync()) {
+                        uint32_t sf_k_base = k_block_idx / kNumSFBStagesPerLoad * SF_PACKED_K_PER_STAGE;
+                        #pragma unroll
+                        for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                            tma_copy<BLOCK_N, 1, 0, 1>(&tensor_map_sfb, full_barriers[s], smem_sfb[s] + pk * SF_BLOCK_N, n_block_idx * BLOCK_N,
+                                                       scheduler.template get_global_idx<true, KGroupedIndexType::SF_K>(shape_sfb_k, 1, sf_k_base + pk, m_block_idx));
+                        }
+                        num_arrival_bytes += BLOCK_N * SF_PACKED_K_PER_STAGE * sizeof(uint32_t);
+                    }
+
+                    if (cute::elect_one_sync())
+                        full_barriers[s]->arrive_and_expect_tx(num_arrival_bytes);
+                }
+
+                #pragma unroll
+                for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                    empty_barriers[s]->wait(phase ^ 1);
+                    if (cute::elect_one_sync())
+                        full_barriers[s]->arrive();
+                }
+            });
+        }
+    } else if (warp_idx == 1 and is_leader_cta) {
+        // ========== Warp 1: UTCCP SF copy + MMA ==========
+        constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
+        constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
+        constexpr uint32_t UMMA_K_INT32 = UMMA_K_FP4 / FP4_ELEMS_PER_INT32;
+        constexpr uint32_t NUM_K_ITERS_PER_STAGE = BLOCK_K / UMMA_K_INT32;
+        constexpr uint32_t NUM_N_ITERS = BLOCK_N / UMMA_N;
+
+        auto instr_desc_mxf4 = cute::UMMA::make_instr_desc_block_scaled<
+            cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
+            UMMA_M, UMMA_N, kMajorA, kMajorB>();
+
+        using cute_mma_mxf4_t = cute::conditional_t<kNumMulticast == 1,
+            cute::SM100_MMA_MXF4_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
+                                    cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
+                                    kMajorA, kMajorB>,
+            cute::SM100_MMA_MXF4_2x1SM_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
+                                          cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
+                                          kMajorA, kMajorB>>;
+
+        DG_STATIC_ASSERT(UMMA_M == 128, "MXF4 requires M=128");
+        DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256), "Invalid MXF4 N-mode size");
+
+        using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
+            cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
+        auto sf_desc = make_sf_desc(nullptr);
+
+        constexpr uint32_t SMEM_A_SIZE_PER_STAGE_PACKED = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t);
+        constexpr uint32_t SMEM_B_SIZE_PER_STAGE_PACKED = LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t);
+        auto a_desc_base = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a_packed[0], 0, 0);
+        auto b_desc_base = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b_packed[0], 0, 0);
+
+        // MXF4 SF addressing constants
+        constexpr uint32_t kGroupsPerUmmaStep = UMMA_K_FP4 / MXF4_VS;            // 2
+        constexpr uint32_t kGroupsPerPacked = 4;
+        constexpr uint32_t kUmmaStepsPerPacked = kGroupsPerPacked / kGroupsPerUmmaStep; // 2
+        constexpr uint32_t kSfaColsPerPackedGroup = SF_BLOCK_M / 32;
+        constexpr uint32_t kSfbColsPerPackedGroup = SF_BLOCK_N / 32;
+
+        // Pre-compute runtime descriptors (sf_id alternates 0, 2, 0, 2)
+        const auto runtime_desc_sf0 = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, 0);
+        const auto runtime_desc_sf2 = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, kGroupsPerUmmaStep);
+
+        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
+                auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
+                tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+                tcgen05_after_thread_sync();
+
+                auto empty_barrier_arrive = [&](uint32_t s, bool do_tmem_full_arrive) {
+                    auto umma_arrive = [](const uint64_t* barrier) {
+                        if constexpr (kNumMulticast == 1) {
+                            cutlass::arch::umma_arrive(barrier);
+                        } else {
+                            constexpr uint16_t kCTAMask = (1 << kNumMulticast) - 1;
+                            cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask);
+                        }
+                    };
+                    umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[s]));
+                    if (do_tmem_full_arrive)
+                        umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
+                };
+
+                launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
+                    constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
+                    const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
+
+                    #pragma unroll
+                    for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
+                        with_sf_full_barriers[s]->wait(phase);
+                        tcgen05_after_thread_sync();
+
+                        // UTCCP: copy SF from SMEM → TMEM
+                        // Must stay on warp 1: SF TMEM cols are reused across stages,
+                        // so UTCCP must be serialized with MMA on the same warp.
+                        const uint32_t sfa_copy_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
+                        if (sfa_copy_stage == 0 and cute::elect_one_sync()) {
+                            #pragma unroll
+                            for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
+                                    replace_smem_desc_addr(sf_desc, smem_sfa[s] + pk * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
+                                    cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + pk * (SF_BLOCK_M / 32) + i * 4);
+                                }
+                            }
+                            #pragma unroll
+                            for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                    replace_smem_desc_addr(sf_desc, smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                                    cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + pk * (SF_BLOCK_N / 32) + i * 4);
+                                }
+                            }
+                        }
+                        __syncwarp();
+
+                        // MMA loop
+                        uint32_t a_desc_stage_lo = a_desc_base.lo + s * (SMEM_A_SIZE_PER_STAGE_PACKED / 16);
+                        uint32_t b_desc_stage_lo = b_desc_base.lo + s * (SMEM_B_SIZE_PER_STAGE_PACKED / 16);
+
+                        #pragma unroll
+                        for (uint32_t k = 0; k < NUM_K_ITERS_PER_STAGE; ++k) {
+                            uint32_t packed_group = k / kUmmaStepsPerPacked;
+                            uint32_t tmem_sfa_base = kTmemStartColOfSFA + packed_group * kSfaColsPerPackedGroup;
+                            uint32_t tmem_sfb_k    = kTmemStartColOfSFB + packed_group * kSfbColsPerPackedGroup;
+                            const auto& runtime_desc_k = (k % kUmmaStepsPerPacked == 0) ? runtime_desc_sf0 : runtime_desc_sf2;
+
+                            #pragma unroll
+                            for (uint32_t n = 0; n < NUM_N_ITERS; ++n) {
+                                auto b_desc = b_desc_base;
+                                b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, uint32_t>(
+                                    b_desc_stage_lo, n * UMMA_N * BLOCK_K, k * UMMA_K_INT32);
+
+                                #pragma unroll
+                                for (uint32_t w = 0; w < kNumMWaves; ++w) {
+                                    auto a_desc = a_desc_base;
+                                    a_desc.lo = advance_umma_desc_lo<kMajorA, BLOCK_M, kSwizzleAMode, uint32_t>(
+                                        a_desc_stage_lo, w * LAYOUT_AD_M * BLOCK_K, k * UMMA_K_INT32);
+
+                                    uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
+                                    cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col,
+                                                         k_iter > 0 or s > 0 or k > 0,
+                                                         runtime_desc_k,
+                                                         tmem_sfa_base + w * (kNumUTCCPAlignedElems / 32),
+                                                         tmem_sfb_k);
+                                }
+                            }
+                        }
+
+                        empty_barrier_arrive(s, is_last_iter and s == kNumInnerStages - 1);
+                    }
+
+                    #pragma unroll
+                    for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                        with_sf_full_barriers[s]->wait(phase);
+                        empty_barrier_arrive(s, false);
+                    }
+                });
+            });
+        }
+    } else if (warp_idx == 2) {
+        // ========== Warp 2: SF transpose ==========
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             uint32_t values[4];
@@ -284,285 +495,47 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
             }
         };
 
-        // ========== TMA (warp 3) + UTCCP (warp 2) + MMA MXF4 (warps 0–3) ==========
-        using ElemAB = cutlass::float_e2m1_t;  // MXF4 逻辑 A/B 元素类型（4bit 对应的 8bit 容器）
-        constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
-        constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
-        constexpr uint32_t UMMA_K_INT32 = UMMA_K_FP4 / FP4_ELEMS_PER_INT32;
-        constexpr uint32_t NUM_K_ITERS_PER_STAGE = BLOCK_K / UMMA_K_INT32;
-        constexpr uint32_t NUM_N_ITERS = BLOCK_N / UMMA_N;
-        
-        auto instr_desc_mxf4 = cute::UMMA::make_instr_desc_block_scaled<
-            cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
-            UMMA_M, UMMA_N, kMajorA, kMajorB>();
-        
-        using cute_mma_mxf4_t = cute::conditional_t<kNumMulticast == 1,
-            cute::SM100_MMA_MXF4_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
-                                    cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
-                                    kMajorA, kMajorB>,
-            cute::SM100_MMA_MXF4_2x1SM_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
-                                          cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
-                                          kMajorA, kMajorB>>;
-        
-        DG_STATIC_ASSERT(UMMA_M == 128, "MXF4 requires M=128");
-        DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256), "Invalid MXF4 N-mode size");
-
-        // UTCCP type for SMEM→TMEM SF copy (same as original FP8)
-        using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
-            cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
-        auto sf_desc = make_sf_desc(nullptr);
-
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
-                auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
-                // Only the MMA warp needs to wait for the epilogue to finish reading TMEM
-                if (warp_idx == 1) {
-                    tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
-                    tcgen05_after_thread_sync();
+            launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
+                constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
+                const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
+
+                #pragma unroll
+                for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
+                    full_barriers[s]->wait(phase);
+
+                    const uint32_t sfa_ut_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
+                    if (sfa_ut_stage == 0) {
+                        #pragma unroll
+                        for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
+                                utccp_required_smem_warp_transpose(smem_sfa[s] + pk * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
+                        }
+                        cutlass::arch::fence_view_async_shared();
+                    }
+
+                    const uint32_t sfb_ut_stage = (k_iter * kNumStages + s) % kNumSFBStagesPerLoad;
+                    if (sfb_ut_stage == 0) {
+                        #pragma unroll
+                        for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
+                                fill_sfb_missing_k_groups(smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                                utccp_required_smem_warp_transpose(smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                            }
+                        }
+                        cutlass::arch::fence_view_async_shared();
+                    }
+
+                    with_sf_full_barriers[s]->arrive(0u);
                 }
 
-                auto empty_barrier_arrive = [&](uint32_t s, bool do_tmem_full_arrive) {
-                    auto umma_arrive = [](const uint64_t* barrier) {
-                        if constexpr (kNumMulticast == 1) {
-                            cutlass::arch::umma_arrive(barrier);
-                        } else {
-                            constexpr uint16_t kCTAMask = (1 << kNumMulticast) - 1;
-                            cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask);
-                        }
-                    };
-                    umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[s]));
-
-                    // NOTES: the tensor memory accumulator pipeline has nothing to do with multicasting
-                    if (do_tmem_full_arrive)
-                        umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
-                };
-
-                launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
-                    constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
-                    const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
-
-                    #pragma unroll
-                    for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
-                        if (warp_idx == 3) {
-                            empty_barriers[s]->wait(phase ^ 1);
-
-                            uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx);
-                            uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), KGroupedIndexType::MN>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
-
-                            DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous or kMajorA == cute::UMMA::Major::K, "Invalid major");
-                            uint32_t k_block_idx = k_iter * kNumStages + s;
-                            uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), KGroupedIndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
-                            uint32_t k_b_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::MN), KGroupedIndexType::K>(shape_k, BLOCK_K, k_block_idx, m_block_idx);
-
-                            if constexpr (kNumMulticast > 1) {
-                                m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * LOAD_BLOCK_M) : 0;
-                                n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
-                            }
-
-                            if (cute::elect_one_sync()) {
-                                if constexpr (kMajorA == cute::UMMA::Major::K)
-                                    tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], k_a_idx, m_idx);
-                                if constexpr (kMajorA == cute::UMMA::Major::MN)
-                                    tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a_packed[s], m_idx, k_a_idx);
-                                if constexpr (kMajorB == cute::UMMA::Major::K)
-                                    tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b_packed[s], k_b_idx, n_idx);
-                                if constexpr (kMajorB == cute::UMMA::Major::MN)
-                                    tma_copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b_packed[s], n_idx, k_b_idx);
-                            }
-                            auto num_arrival_bytes = SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE;
-
-                            const uint32_t sfa_tma_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
-                            if (sfa_tma_stage == 0 and cute::elect_one_sync()) {
-                                uint32_t sf_k_base = k_block_idx / kNumSFAStagesPerLoad * SF_PACKED_K_PER_STAGE;
-                                #pragma unroll
-                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
-                                    auto sf_k = scheduler.template get_global_idx<
-                                        (kGemmType != GemmType::MGroupedContiguous),
-                                        KGroupedIndexType::SF_K>(
-                                            shape_sfa_k, 1, sf_k_base + pk);
-
-                                    tma_copy<BLOCK_M, 1, 0, 1>(&tensor_map_sfa, full_barriers[s], smem_sfa[s] + pk * SF_BLOCK_M, m_block_idx * BLOCK_M,
-                                                               scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::SF_K>(shape_sfa_k, 1, sf_k_base + pk));
-                                }
-                                num_arrival_bytes += BLOCK_M * SF_PACKED_K_PER_STAGE * sizeof(uint32_t);
-                            }
-                            const uint32_t sfb_tma_stage = (k_iter * kNumStages + s) % kNumSFBStagesPerLoad;
-                            if (sfb_tma_stage == 0 and cute::elect_one_sync()) {
-                                uint32_t sf_k_base = k_block_idx / kNumSFBStagesPerLoad * SF_PACKED_K_PER_STAGE;
-                                #pragma unroll
-                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
-                                    auto sf_k = scheduler.template get_global_idx<
-                                        true, KGroupedIndexType::SF_K>(
-                                            shape_sfb_k, 1, sf_k_base + pk, m_block_idx);
-
-                                    tma_copy<BLOCK_N, 1, 0, 1>(&tensor_map_sfb, full_barriers[s], smem_sfb[s] + pk * SF_BLOCK_N, n_block_idx * BLOCK_N,
-                                                               scheduler.template get_global_idx<true, KGroupedIndexType::SF_K>(shape_sfb_k, 1, sf_k_base + pk, m_block_idx));
-                                }
-                                num_arrival_bytes += BLOCK_N * SF_PACKED_K_PER_STAGE * sizeof(uint32_t);
-                            }
-
-                            if (cute::elect_one_sync())
-                                full_barriers[s]->arrive_and_expect_tx(num_arrival_bytes);
-                        }
-
-                        if (warp_idx == 2) {
-                            full_barriers[s]->wait(phase);
-
-                            const uint32_t sfa_ut_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
-                            if (sfa_ut_stage == 0) {
-                                #pragma unroll
-                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
-                                        utccp_required_smem_warp_transpose(smem_sfa[s] + pk * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
-                                }
-                                cutlass::arch::fence_view_async_shared();
-                            }
-
-                            const uint32_t sfb_ut_stage = (k_iter * kNumStages + s) % kNumSFBStagesPerLoad;
-                            if (sfb_ut_stage == 0) {
-                                #pragma unroll
-                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                        fill_sfb_missing_k_groups(smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
-                                        utccp_required_smem_warp_transpose(smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
-                                    }
-                                }
-                                cutlass::arch::fence_view_async_shared();
-                            }
-
-                            with_sf_full_barriers[s]->arrive(0u);
-                        }
-
-                        // TMA warp (3) skips this wait to enable pipeline overlap:
-                        // it can start TMA for stage s+1 while MMA processes stage s.
-                        if (warp_idx != 3) {
-                            with_sf_full_barriers[s]->wait(phase);
-                            tcgen05_after_thread_sync();
-                        }
-
-                        // ===== MMA warp (warp 1): UTCCP SF copy + MMA =====
-                        if (warp_idx == 1) {
-                            // UTCCP: copy SF from SMEM → TMEM at every SF load boundary
-                            // For per-group random SF, each stage needs fresh SF data in TMEM.
-                            const uint32_t sfa_copy_stage = (k_iter * kNumStages + s) % kNumSFAStagesPerLoad;
-                            if (sfa_copy_stage == 0 and cute::elect_one_sync()) {
-                                #pragma unroll
-                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
-                                        replace_smem_desc_addr(sf_desc, smem_sfa[s] + pk * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
-                                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFA + pk * (SF_BLOCK_M / 32) + i * 4);
-                                    }
-                                }
-                                #pragma unroll
-                                for (uint32_t pk = 0; pk < SF_PACKED_K_PER_STAGE; ++ pk) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
-                                        replace_smem_desc_addr(sf_desc, smem_sfb[s] + pk * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
-                                        cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + pk * (SF_BLOCK_N / 32) + i * 4);
-                                    }
-                                }
-                            }
-                            __syncwarp();
-
-                            // --- MMA loop ---
-                            constexpr uint32_t SMEM_A_SIZE_PER_STAGE_PACKED =
-                                LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t);
-                            constexpr uint32_t SMEM_B_SIZE_PER_STAGE_PACKED =
-                                LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t);
-
-                            auto a_desc_base =
-                                make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(
-                                    smem_a_packed[0], 0, 0);
-                            auto b_desc_base =
-                                make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(
-                                    smem_b_packed[0], 0, 0);
-
-                            uint32_t a_desc_stage_lo =
-                                a_desc_base.lo + s * (SMEM_A_SIZE_PER_STAGE_PACKED / 16);
-                            uint32_t b_desc_stage_lo =
-                                b_desc_base.lo + s * (SMEM_B_SIZE_PER_STAGE_PACKED / 16);
-
-                            // Per-k SF addressing for MXF4 block-scaled MMA.
-                            // Each UMMA step processes UMMA_K_FP4 = 64 FP4 = 2 groups of VS=32.
-                            // 4 UE8M0 packed per uint32 in TMEM → 2 UMMA steps exhaust one packed group.
-                            // sf_id (2-bit) selects the starting byte within the packed uint32.
-                            constexpr uint32_t kGroupsPerUmmaStep = UMMA_K_FP4 / MXF4_VS;            // 2
-                            constexpr uint32_t kGroupsPerPacked = 4;
-                            constexpr uint32_t kUmmaStepsPerPacked = kGroupsPerPacked / kGroupsPerUmmaStep; // 2
-                            constexpr uint32_t kSfaColsPerPackedGroup = SF_BLOCK_M / 32;
-                            constexpr uint32_t kSfbColsPerPackedGroup = SF_BLOCK_N / 32;
-
-                            // Pre-compute the two runtime descriptors (sf_id alternates 0, 2, 0, 2)
-                            const auto runtime_desc_sf0 = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, 0);
-                            const auto runtime_desc_sf2 = make_runtime_instr_desc_with_sf_id(instr_desc_mxf4, kGroupsPerUmmaStep);
-
-                            #pragma unroll
-                            for (uint32_t k = 0; k < NUM_K_ITERS_PER_STAGE; ++k) {
-                                uint32_t packed_group = k / kUmmaStepsPerPacked;
-
-                                uint32_t tmem_sfa_base = kTmemStartColOfSFA + packed_group * kSfaColsPerPackedGroup;
-                                uint32_t tmem_sfb_k    = kTmemStartColOfSFB + packed_group * kSfbColsPerPackedGroup;
-                                const auto& runtime_desc_k = (k % kUmmaStepsPerPacked == 0) ? runtime_desc_sf0 : runtime_desc_sf2;
-
-                                #pragma unroll
-                                for (uint32_t n = 0; n < NUM_N_ITERS; ++n) {
-                                    auto b_desc = b_desc_base;
-                                    b_desc.lo = advance_umma_desc_lo<
-                                        kMajorB, BLOCK_N, kSwizzleBMode, uint32_t>(
-                                            b_desc_stage_lo,
-                                            n * UMMA_N * BLOCK_K,
-                                            k * UMMA_K_INT32);
-
-                                    #pragma unroll
-                                    for (uint32_t w = 0; w < kNumMWaves; ++w) {
-                                        auto a_desc = a_desc_base;
-                                        a_desc.lo = advance_umma_desc_lo<
-                                            kMajorA, BLOCK_M, kSwizzleAMode, uint32_t>(
-                                                a_desc_stage_lo,
-                                                w * LAYOUT_AD_M * BLOCK_K,
-                                                k * UMMA_K_INT32);
-
-                                        uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
-                                        bool do_accumulate = (k_iter > 0 || s > 0 || k > 0);
-
-                                        uint32_t tmem_sfa_k = tmem_sfa_base + w * (kNumUTCCPAlignedElems / 32);
-                                        cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col, do_accumulate,
-                                                             runtime_desc_k, tmem_sfa_k, tmem_sfb_k);
-                                    }
-                                }
-                            }
-                        } // end warp_idx == 1 (MMA)
-
-                        // Commit to the mbarrier object
-                        // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
-                        if (warp_idx == 1) {
-                            empty_barrier_arrive(s, is_last_iter and s == kNumInnerStages - 1);
-                        }
-                    }
-
-                    #pragma unroll
-                    for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                        if (warp_idx == 3) {
-                            empty_barriers[s]->wait(phase ^ 1);
-                            if (cute::elect_one_sync())
-                                full_barriers[s]->arrive();
-                        }
-                        if (warp_idx == 2) {
-                            full_barriers[s]->wait(phase);
-                            with_sf_full_barriers[s]->arrive(0u);
-                        }
-                        if (warp_idx != 3) {
-                            with_sf_full_barriers[s]->wait(phase);
-                        }
-                        if (warp_idx == 1) {
-                            empty_barrier_arrive(s, false);
-                        }
-                    }
-                    
-                });
+                #pragma unroll
+                for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
+                    full_barriers[s]->wait(phase);
+                    with_sf_full_barriers[s]->arrive(0u);
+                }
             });
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32) {
