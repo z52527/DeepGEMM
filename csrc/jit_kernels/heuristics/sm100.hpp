@@ -69,7 +69,8 @@ struct SM100ArchSpec {
             const auto& [sf_block_m_, sf_block_n_] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
             sf_block_m = sf_block_m_, sf_block_n = sf_block_n_;
         }
-        const int sf_tmem_k_mult = (ab_dtype == torch::kInt) ? 2 : 1;
+        // FP4: sf_packed_k_per_stage = block_k * 8 / 32 / 4 = block_k / 16
+        const int sf_tmem_k_mult = (ab_dtype == torch::kInt) ? (block_k / 16) : 1;
         if (((2 * block_n) + (sf_block_m / 32) * sf_tmem_k_mult + (sf_block_n / 32) * sf_tmem_k_mult) > 512)
             return false;
 
@@ -123,7 +124,7 @@ struct SM100ArchSpec {
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
-            const int sf_packed_k_per_stage = (ab_dtype == torch::kInt) ? 2 : 1;
+            const int sf_packed_k_per_stage = (ab_dtype == torch::kInt) ? (block_k / 16) : 1;
             smem_sfa_per_stage = sf_block_m * 4 * sf_packed_k_per_stage;
             smem_sfb_per_stage = sf_block_n * 4 * sf_packed_k_per_stage;
         } else {
@@ -150,5 +151,166 @@ struct SM100ArchSpec {
         return 4;
     }
 };
+
+// ============================================================
+// FP4-specific heuristic for SM100
+// ============================================================
+// FP4 (MXF4 E2M1) has tighter hardware constraints than FP8:
+//   - BLOCK_M is fixed to 128 (UMMA_M=128 for MXF4 2-CTA MMA)
+//   - BLOCK_K is fixed to 32 int32 (= 256 FP4 elements = 128 bytes)
+//   - No multicast (MXF4 2-CTA MMA only supports M=128)
+//   - SF occupies 2x TMEM columns vs FP8 (sf_packed_k_per_stage=2)
+//   - TMEM capacity limits max BLOCK_N to ~240
+//
+// Strategy: same wave-minimization as FP8, but with a much narrower
+// search space (only BLOCK_N varies). Tie-breaking favors smaller
+// BLOCK_N to reduce wasted computation, since FP4's high arithmetic
+// intensity means we're less sensitive to launch overhead.
+
+static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
+                                      const int& m, const int& n, const int& k, const int& num_groups,
+                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                      const at::ScalarType& cd_dtype,
+                                      const bool& with_accumulation, const int& num_sms) {
+    constexpr auto ab_dtype = at::kInt;  // FP4 packed as int32
+    constexpr auto kernel_type = KernelType::Kernel1D1D;
+    constexpr int block_m = 128;   // MXF4 UMMA_M is always 128
+    constexpr int block_k = 32;    // 128 bytes / sizeof(int32) = 32 (256 FP4 per stage)
+
+    // Build candidate BLOCK_N list with legality check
+    // TMEM constraint: epilogue_stages*BN + (SF_BLOCK_M/32)*sf_pk + (SF_BLOCK_N/32)*sf_pk <= 512
+    // sf_pk = block_k / 16 (SF_PACKED_K_PER_STAGE)
+    constexpr int sf_pk = block_k / 16;
+    constexpr int sf_block_m_cols = (128 / 32) * sf_pk;
+    auto is_fp4_block_n_legal = [&](const int& block_n) -> bool {
+        if (block_n % 16 != 0 || block_n < 16 || block_n > 256)
+            return false;
+        // N%bn!=0 is OK: B TMA OOB columns read garbage but TMA store drops OOB writes.
+        // SFB SMEM padding handled by zero-fill before warp-transpose.
+        if (major_b != cute::UMMA::Major::K && (block_n * static_cast<int>(c10::elementSize(ab_dtype))) % 64 != 0)
+            return false;
+        // TMEM capacity: kernel auto-reduces epilogue stages from 2 to 1 if needed
+        const int sf_block_n = align(block_n, 128);
+        const int sf_block_n_cols = (sf_block_n / 32) * sf_pk;
+        // Check with 1 epilogue stage (minimum)
+        if ((1 * block_n + sf_block_m_cols + sf_block_n_cols) > 512)
+            return false;
+        return true;
+    };
+
+    // Wave-based block_n selection (same logic as FP8 but only block_n varies)
+    const auto get_num_blocks = [=](const int& bn) {
+        return ceil_div(m, block_m) * ceil_div(n, bn) * num_groups;
+    };
+    const auto get_num_waves = [=](const int& bn) {
+        return ceil_div(get_num_blocks(bn), num_sms);
+    };
+    const auto get_last_wave_util = [=](const int& bn) {
+        const auto num_last = get_num_blocks(bn) % num_sms;
+        return num_last == 0 ? num_sms : num_last;
+    };
+
+    int best_block_n = 0;
+    int best_num_waves = 0, best_score = 0;
+    for (int bn = 16; bn <= 256; bn += 16) {
+        if (!is_fp4_block_n_legal(bn))
+            continue;
+
+        const int num_waves = get_num_waves(bn);
+
+        // Estimate pipeline stages for this block_n (conservative: no multicast for smem estimate)
+        const int per_stage_approx = block_m * block_k * 4 + bn * block_k * 4
+                                   + 128 * sf_pk * 4 + align(bn, 128) * sf_pk * 4;
+        const int avail_smem = SM100ArchSpec::smem_capacity - 32768 - 200;
+        const int est_stages = std::min(12, std::max(1, avail_smem / per_stage_approx));
+
+        // Composite score: stages² × bn balances pipeline depth vs tile size.
+        // Squared stages penalizes low pipeline depth, matching empirical sweep data.
+        const int score = est_stages * est_stages * bn;
+
+        bool success = false;
+        if (best_block_n == 0 || num_waves < best_num_waves) {
+            success = true;
+        } else if (num_waves == best_num_waves && bn <= n && score > best_score) {
+            success = true;
+        }
+
+        if (success) {
+            best_block_n = bn;
+            best_num_waves = num_waves;
+            best_score = score;
+        }
+    }
+    DG_HOST_ASSERT(best_block_n > 0);
+
+    // Allow env override for benchmarking
+    if (const auto env_bn = get_env<int>("DG_FP4_BLOCK_N"); env_bn > 0) {
+        DG_HOST_ASSERT(env_bn % 16 == 0 && env_bn <= 256);
+        best_block_n = env_bn;
+    }
+
+    // B-multicast for FP4: 2CTA along M, UMMA_M=256, each CTA loads half of B
+    // A-multicast is not supported (2x1SM distributes along M only)
+    MulticastConfig multicast_config = {1, false};
+    if (m >= 512
+        && is_multicast_legal(m, block_m, 2, num_sms, true)
+        && (gemm_type == GemmType::Normal || gemm_type == GemmType::KGroupedContiguous)) {
+        multicast_config = {2, false};  // B-multicast
+    }
+
+    // Find max pipeline stages that fit in shared memory
+    constexpr int smem_capacity = SM100ArchSpec::smem_capacity;
+    int best_num_stages = 0;
+    SharedMemoryConfig best_smem_config;
+    for (int num_stages = std::min(12, ceil_div(k, block_k)); num_stages > 0; --num_stages) {
+        best_smem_config = get_smem_config<SM100ArchSpec>(kernel_type,
+                                                          m, n, k,
+                                                          block_m, best_block_n, block_k,
+                                                          major_a, major_b,
+                                                          ab_dtype, cd_dtype,
+                                                          num_stages, multicast_config);
+        if (best_smem_config.smem_size <= smem_capacity) {
+            best_num_stages = num_stages;
+            break;
+        }
+    }
+    DG_HOST_ASSERT(best_num_stages != 0);
+
+    const auto config = GemmConfig {
+        .gemm_type = gemm_type,
+        .kernel_type = kernel_type,
+        .ab_dtype = ab_dtype,
+        .cd_dtype = cd_dtype,
+        .major_a = major_a,
+        .major_b = major_b,
+        .with_accumulation = with_accumulation,
+        .block_m = block_m,
+        .block_n = best_block_n,
+        .block_k = block_k,
+        .num_stages = best_num_stages,
+        .num_last_stages = ceil_div(k, block_k) % best_num_stages,
+        .num_sms = num_sms,
+        .tc_util = device_runtime->get_tc_util(),
+        .multicast_config = multicast_config,
+        .smem_config = best_smem_config,
+        .thread_config = SM100ArchSpec::get_thread_config(kernel_type, block_m, best_block_n)
+    };
+
+    // Print config
+    if (get_env<int>("DG_JIT_DEBUG") || get_env<int>("DG_PRINT_CONFIGS")) {
+        auto key = std::make_tuple(gemm_type, m, n, k, num_groups);
+        static std::set<decltype(key)> printed;
+        if (printed.count(key) == 0) {
+            printf("FP4 GEMM: M: %d, N: %d, K: %d, groups: %d -> "
+                   "block N: %d, stages: %d, last stages: %d, "
+                   "shared memory: %d bytes, SMs: %d\n",
+                   m, n, k, num_groups, best_block_n,
+                   best_num_stages, config.num_last_stages,
+                   best_smem_config.smem_size, num_sms);
+            printed.insert(key);
+        }
+    }
+    return config;
+}
 
 } // namespace deep_gemm

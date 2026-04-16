@@ -95,7 +95,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t SF_PACKED_K_PER_STAGE = SF_K_PER_STAGE / 4;
     
     DG_STATIC_ASSERT(BLOCK_M % LAYOUT_AD_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
-    DG_STATIC_ASSERT(BLOCK_K == 32, "Packed FP4 path expects BLOCK_K == 32");
+    DG_STATIC_ASSERT(BLOCK_K == 16 or BLOCK_K == 32, "FP4 BLOCK_K must be 16 or 32 int32");
 
     // ========== 动态形状处理 ==========
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
@@ -130,7 +130,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     
-    DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
+    DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "FP4 only supports B-multicast (2CTA along M)");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M and BLOCK_M % LAYOUT_AD_M == 0, "Only support tensor memory layout A/D");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
 
@@ -350,7 +350,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                                           cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
                                           kMajorA, kMajorB>>;
 
-        DG_STATIC_ASSERT(UMMA_M == 128, "MXF4 requires M=128");
+        DG_STATIC_ASSERT(UMMA_M == 128 or UMMA_M == 256, "MXF4 supports M=128 (1CTA) or M=256 (2CTA)");
         DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256), "Invalid MXF4 N-mode size");
 
         using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
@@ -485,11 +485,12 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         };
         auto fill_sfb_missing_k_groups = [&](uint32_t* smem_ptr) {
             if constexpr (BLOCK_N < kNumUTCCPAlignedElems) {
-                constexpr uint32_t kKGroups = kNumUTCCPAlignedElems / 32;
+                // Zero-fill [BLOCK_N, SF_BLOCK_N) before warp-transpose: XOR pattern
+                // reads all 128 elements, so uninitialized positions corrupt valid data.
                 #pragma unroll
-                for (uint32_t c = 1; c < kKGroups; ++c) {
-                    if (lane_idx < BLOCK_N)
-                        st_shared(smem_ptr + c * 32 + lane_idx, ld_shared(smem_ptr + lane_idx));
+                for (uint32_t pos = lane_idx; pos < kNumUTCCPAlignedElems; pos += 32) {
+                    if (pos >= BLOCK_N)
+                        st_shared(smem_ptr + pos, 0u);
                 }
                 __syncwarp();
             }

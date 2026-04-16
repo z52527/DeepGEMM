@@ -283,6 +283,31 @@ def test_random_sf():
     return all_pass
 
 
+def test_multicast():
+    """大 M 测试：触发 B-multicast (M>=512, 2CTA along M, UMMA_M=256)"""
+    print('Test: B-multicast (M>=512, 2CTA)')
+    configs = [
+        (512,  128,  256),
+        (512,  128,  512),
+        (512,  128, 1024),
+        (1024, 128,  256),
+        (1024, 128,  512),
+    ]
+    all_pass = True
+    for m, n, k in configs:
+        a = pack_fp4_random(m, k)
+        b = pack_fp4_random(n, k)
+        sf_a, sf_b = generate_mxf4_scale_factors(m, n, k, random_sf=True)
+        d = run_kernel(a, b, sf_a, sf_b, m, n)
+        ref = fp4_reference(a, b, m, n, sf_a, sf_b)
+        max_diff = torch.abs(d.cpu().float() - ref.float()).max().item()
+        ok = max_diff < 1.0
+        if not ok:
+            all_pass = False
+        print(f'  M={m:4d} N={n:4d} K={k:4d}: max_diff={max_diff:.4f} {"PASS" if ok else "FAIL"}')
+    return all_pass
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -297,7 +322,8 @@ if __name__ == '__main__':
         ('sweep',          test_value_sweep()),
         ('asymmetric',     test_asymmetric_values()),
         ('uniform_sf',     test_uniform_sf()),
-        ('random_sf',    test_random_sf()),
+        ('random_sf',      test_random_sf()),
+        ('multicast',      test_multicast()),
     ]
 
     print()

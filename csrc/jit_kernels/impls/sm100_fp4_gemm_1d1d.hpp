@@ -104,24 +104,29 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         k_work = aligned_k;
     }
 
-    auto config = get_best_config<SM100ArchSpec>(
-        GemmType::Normal, KernelType::Kernel1D1D,
-        m, n, k, 1, major_a, major_b,
-        actual_ab_dtype, d.scalar_type(), c.has_value(),
-        device_runtime->get_num_sms());
-    // MXF4 2-CTA MMA only supports M=128, so disable multicast for FP4
-    config.multicast_config = {1, false};
+    // Use FP4-specific heuristic: block_m=128, B-multicast when M>=512, tighter TMEM
+    auto config = is_fp4_packed
+        ? get_best_fp4_config(GemmType::Normal,
+                              m, n, k, 1, major_a, major_b,
+                              d.scalar_type(), c.has_value(),
+                              device_runtime->get_num_sms())
+        : get_best_config<SM100ArchSpec>(
+                              GemmType::Normal, KernelType::Kernel1D1D,
+                              m, n, k, 1, major_a, major_b,
+                              actual_ab_dtype, d.scalar_type(), c.has_value(),
+                              device_runtime->get_num_sms());
 
     std::cout << "Using config: block_m=" << config.block_m
             << ", block_n=" << config.block_n
             << ", block_k=" << config.block_k
-            << ", num_stages=" << config.num_stages;
+            << ", num_stages=" << config.num_stages
+            << ", multicast=" << config.multicast_config.num_multicast
+            << (config.multicast_config.is_multicast_on_a ? "(A)" : "(B)");
     if (is_fp4_packed) {
         std::cout << " (FP4 packed mode)";
     }
     std::cout << std::endl;
     const auto& cd = c.value_or(d);
-    // 之前禁用 swizzle 导致了 TMA 和 UMMA 之间的内存访问不匹配
     const auto& tensor_map_a = make_tma_a_desc(major_a, a_work, m, k_work,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
                                                config.block_k,
