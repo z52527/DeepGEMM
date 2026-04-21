@@ -210,8 +210,20 @@ static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
         return num_last == 0 ? num_sms : num_last;
     };
 
+    // TMEM double-buffer feasibility: kernel sets kNumEpilogueStages=2 when
+    // 2*BN + SFA_cols + SFB_cols <= 512, else 1. Two epi stages enable
+    // concurrent MMA/epilogue on different TMEM halves (Modular Part 4 K8),
+    // giving ~6-15% perf on large tiles. Treat it as a tiebreaker within the
+    // same wave count — prefer 2-stage capable BN over 1-stage BN.
+    auto fits_2_epi_stages = [&](int bn) {
+        const int sf_block_n = align(bn, 128);
+        const int sf_block_n_cols = (sf_block_n / 32) * sf_pk;
+        return (2 * bn + sf_block_m_cols + sf_block_n_cols) <= 512;
+    };
+
     int best_block_n = 0;
     int best_num_waves = 0, best_score = 0;
+    bool best_fits_2epi = false;
     for (int bn = 16; bn <= 256; bn += 16) {
         if (!is_fp4_block_n_legal(bn))
             continue;
@@ -227,18 +239,34 @@ static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
         // Composite score: stages² × bn balances pipeline depth vs tile size.
         // Squared stages penalizes low pipeline depth, matching empirical sweep data.
         const int score = est_stages * est_stages * bn;
+        const bool cur_fits_2epi = fits_2_epi_stages(bn);
+
+        // TMEM double-buffer benefit only materializes when each SM processes
+        // >=2 tiles — the kernel alternates accum_stage_idx across iterations
+        // of scheduler.current_iter, so single-wave shapes see no overlap
+        // between tile epilogue and next tile MMA. Empirically verified:
+        //   1024x4096x7168 (1 wave): bn=256/1-epi (2330T) beats bn=240/2-epi (2314T)
+        //   4096x4096x7168 (4 waves): bn=240/2-epi (3871T) beats bn=256/1-epi (3621T)
+        const bool consider_epi = num_waves >= 2;
 
         bool success = false;
         if (best_block_n == 0 || num_waves < best_num_waves) {
             success = true;
-        } else if (num_waves == best_num_waves && bn <= n && score > best_score) {
-            success = true;
+        } else if (num_waves == best_num_waves && bn <= n) {
+            // Tiebreak 1 (multi-wave only): prefer BN enabling 2 epi stages.
+            if (consider_epi && cur_fits_2epi && !best_fits_2epi) {
+                success = true;
+            // Tiebreak 2: single-wave or same epi-status → pure score.
+            } else if ((!consider_epi || cur_fits_2epi == best_fits_2epi) && score > best_score) {
+                success = true;
+            }
         }
 
         if (success) {
             best_block_n = bn;
             best_num_waves = num_waves;
             best_score = score;
+            best_fits_2epi = cur_fits_2epi;
         }
     }
     DG_HOST_ASSERT(best_block_n > 0);
