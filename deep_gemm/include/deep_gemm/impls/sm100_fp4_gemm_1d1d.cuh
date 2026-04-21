@@ -6,6 +6,7 @@
 #include <cutlass/float8.h>
 
 #include <deep_gemm/common/scheduler.cuh>
+#include <deep_gemm/common/scheduler_clc.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/sm100_utils.cuh>
 
@@ -60,7 +61,8 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t>
+          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
+          bool kUseCLC = false>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -133,6 +135,9 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "FP4 only supports B-multicast (2CTA along M)");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M and BLOCK_M % LAYOUT_AD_M == 0, "Only support tensor memory layout A/D");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
+    // CLC (Cluster Launch Control) scheduler currently only supports 1-CTA mode.
+    // 2-CTA mode needs cluster-wide mbarrier coordination which is a follow-up.
+    DG_STATIC_ASSERT(not kUseCLC or kNumMulticast == 1, "CLC scheduler requires kNumMulticast == 1");
 
     // ========== 共享内存大小计算 ==========
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;

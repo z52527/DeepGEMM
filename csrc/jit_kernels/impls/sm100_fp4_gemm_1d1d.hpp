@@ -32,6 +32,10 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        // Compile-time CLC flag: threaded through as an extra template arg.
+        // Always false for now — heuristic will flip it on for target shapes
+        // once the kernel-side CLC integration lands.
+        const bool use_clc = false;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm100_fp4_gemm_1d1d.cuh>
 
@@ -48,7 +52,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}, {}
+        {}, {}, {},
+        {}
     >);
 }};
 )",
@@ -61,7 +66,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms,
-        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype));
+        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype),
+        use_clc);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
