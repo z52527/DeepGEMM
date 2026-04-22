@@ -16,7 +16,7 @@ sys.path.insert(0, '/home/scratch.runchuz_gpu/testspace/test_fp4_benchmark')
 
 import torch
 import deep_gemm
-from deep_gemm.testing import bench
+from deep_gemm.testing import bench, bench_kineto
 from generators import KernelType, get_ue8m0_usage
 
 # ── E2M1 lookup table ────────────────────────────────────────
@@ -114,6 +114,15 @@ def run_deepgemm(a_packed, b_packed, sf_a, sf_b, m, n, block_n=None):
 
 
 def bench_deepgemm(a_packed, b_packed, sf_a, sf_b, m, n, block_n=None):
+    """Measure only the main FP4 GEMM kernel time (exclude SF transform).
+
+    Mirrors the FP8 benchmark approach in tests/test_fp8.py (bench_kineto
+    filtered to the GEMM kernel name) so the comparison is apples-to-apples
+    with cuBLAS/FlashInfer, which also measure only their main GEMM kernel.
+    The SF float32->UE8M0 transform (`transpose_and_pack_fp32_into_ue8m0`)
+    is excluded — in real inference pipelines SF is typically pre-quantized
+    as part of the model weights, not recomputed per call.
+    """
     if block_n is not None:
         os.environ['DG_FP4_BLOCK_N'] = str(block_n)
     else:
@@ -128,7 +137,8 @@ def bench_deepgemm(a_packed, b_packed, sf_a, sf_b, m, n, block_n=None):
             recipe=(1, 1, 128), disable_ue8m0_cast=duc,
         )
 
-    return bench(fn, num_warmups=5, num_tests=20)
+    # Filter profiler output to only the FP4 GEMM kernel, matching FP8 tests.
+    return bench_kineto(fn, 'sm100_fp4_gemm', suppress_kineto_output=True)
 
 
 # ── cuBLAS NVFP4 runner ──────────────────────────────────────
