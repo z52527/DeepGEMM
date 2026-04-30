@@ -165,7 +165,8 @@ def run_cublas(a_bf16, b_bf16):
     alpha_val = 1.0 / (a_gsf.item() * b_gsf.item())
     alpha = torch.tensor([alpha_val], dtype=torch.float32, device='cuda')
 
-    out = fp4_gemm_blockwise(a_fp4, a_sf, b_fp4, b_sf, 16, alpha, torch.bfloat16)
+    # Match DeepGEMM output dtype (float32) for apples-to-apples bandwidth.
+    out = fp4_gemm_blockwise(a_fp4, a_sf, b_fp4, b_sf, 16, alpha, torch.float32)
     torch.cuda.synchronize()
     return out, (a_fp4, a_sf, b_fp4, b_sf, alpha)
 
@@ -174,7 +175,8 @@ def bench_cublas(a_fp4, a_sf, b_fp4, b_sf, alpha):
     from cublas_fp4 import fp4_gemm_blockwise
 
     def fn():
-        fp4_gemm_blockwise(a_fp4, a_sf, b_fp4, b_sf, 16, alpha, torch.bfloat16)
+        # Match DeepGEMM output dtype (float32) for apples-to-apples bandwidth.
+        fp4_gemm_blockwise(a_fp4, a_sf, b_fp4, b_sf, 16, alpha, torch.float32)
 
     return bench(fn, num_warmups=5, num_tests=20)
 
@@ -228,6 +230,8 @@ BENCHMARK_SHAPES = [
     (1024, 4096, 7168),
     (1024, 7168, 2048),
     (4096, 4096, 7168),
+    # Square large GEMM
+    (8192, 8192, 8192),
 ]
 
 BLOCK_NS_TO_TEST = [16, 32, 64, 128, 176, 240]
@@ -340,7 +344,7 @@ def test_performance():
     print()
 
     hdr = (f'{"M":>6} {"N":>6} {"K":>6} |'
-           f' {"DeepGEMM":>17} | {"cuBLAS":>17} | {"DG/cuBLAS":>9}')
+           f' {"DeepGEMM":>17} | {"cuBLAS":>17} | {"speedup":>9}')
     sep = '-' * len(hdr)
     print(hdr)
     print(sep)
@@ -374,7 +378,8 @@ def test_performance():
             cb_s = f'{"FAIL":>17}'
 
         if dg_t and cb_t:
-            ratio = f'{dg_t / cb_t:8.2f}x'
+            # Speedup = cuBLAS_time / DG_time. >1.0 means DG is faster.
+            ratio = f'{cb_t / dg_t:8.2f}x'
         else:
             ratio = f'{"--":>9}'
 
@@ -387,7 +392,7 @@ def test_performance():
             break
 
     print(sep)
-    print('DG/cuBLAS < 1.0 means DeepGEMM is faster')
+    print('speedup > 1.0 means DeepGEMM is faster (cuBLAS_time / DG_time)')
 
 
 # ── Main ──────────────────────────────────────────────────────
