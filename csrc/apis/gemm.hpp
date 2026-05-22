@@ -131,11 +131,17 @@ static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     const auto& [num_groups, n, k_] = get_shape<3>(b.first);
     const auto& [m_, n_] = get_shape<2>(d);
     const auto& m__ = static_cast<int>(m_indices.numel());
+    const bool is_fp4_packed = (a.first.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    if (is_fp4_packed) {
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+    } else {
+        DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    }
     DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt);
 
     // D must be N-major
@@ -153,7 +159,10 @@ static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+    if (is_fp4_packed and arch_major == 10) {
+        sm100_m_grouped_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, m_indices,
+                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, m_indices,
                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {

@@ -8,6 +8,7 @@ Usage:
 import torch
 import random
 import deep_gemm
+from deep_gemm.testing import bench_kineto, count_bytes
 from generators import KernelType, get_ue8m0_usage
 
 # ============================================================
@@ -112,6 +113,60 @@ def run_kernel(a_packed, b_packed, sf_a, sf_b, m, n, recipe=(1, 1, 128)):
     d = torch.empty((m, n), device='cuda', dtype=torch.float32)
     deep_gemm.fp8_gemm_nt((a_packed, sf_a), (b_packed, sf_b), d, c=None,
                           recipe=recipe, disable_ue8m0_cast=duc)
+    torch.cuda.synchronize()
+    return d
+
+
+def pack_fp4_random_3d(num_groups: int, n: int, k_fp4: int, device='cuda'):
+    """生成 [G, N, K_int32] FP4 packed tensor。"""
+    assert k_fp4 % 8 == 0
+    raw = torch.randint(0, 16, (num_groups, n, k_fp4), dtype=torch.uint8, device=device)
+    packed = torch.zeros(num_groups, n, k_fp4 // 8, dtype=torch.int32, device=device)
+    for i in range(8):
+        packed += (raw[:, :, i::8].to(torch.int32) << (i * 4))
+    return packed
+
+
+def generate_mxf4_sf_3d(num_groups: int, n: int, k_fp4: int, device='cuda', random_sf=False):
+    """生成 SFB [G, N, sf_k] for grouped contiguous."""
+    VS = 32
+    sf_k = ((k_fp4 // VS + 3) // 4) * 4
+    if random_sf:
+        powers = torch.randint(-2, 3, (num_groups, n, sf_k), device=device).float()
+        return torch.pow(2.0, powers)
+    return torch.ones((num_groups, n, sf_k), dtype=torch.float32, device=device)
+
+
+def fp4_reference_grouped(a_packed, b_packed_grouped, m_indices,
+                          n: int, num_groups: int,
+                          sf_a=None, sf_b_grouped=None):
+    """Per-row grouped FP4 reference: D[i] = A[i] @ B[m_indices[i]].T (with SF scaling).
+
+    Padding rows (m_indices == -1) get D[i] = 0.
+    """
+    m = a_packed.shape[0]
+    c = torch.zeros(m, n, dtype=torch.float32)
+    m_idx_cpu = m_indices.cpu()
+    for g in range(num_groups):
+        rows = (m_idx_cpu == g).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            continue
+        a_g = a_packed[rows]
+        sf_a_g = sf_a[rows] if sf_a is not None else None
+        sf_b_g = sf_b_grouped[g] if sf_b_grouped is not None else None
+        c_g = fp4_reference(a_g, b_packed_grouped[g], rows.numel(), n, sf_a_g, sf_b_g)
+        c[rows] = c_g
+    return c
+
+
+def run_kernel_grouped(a_packed, b_packed, sf_a, sf_b, m_indices, m, n, recipe=(1, 1, 128)):
+    """调用 m_grouped_fp8_gemm_nt_contiguous 的 FP4 路径 (int32 dtype 触发)。"""
+    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+    d = torch.empty((m, n), device='cuda', dtype=torch.float32)
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        (a_packed, sf_a), (b_packed, sf_b), d, m_indices,
+        recipe=recipe, disable_ue8m0_cast=duc,
+    )
     torch.cuda.synchronize()
     return d
 
@@ -283,6 +338,220 @@ def test_random_sf():
     return all_pass
 
 
+def test_m_grouped_contiguous():
+    """M-grouped contiguous FP4 GEMM (MoE forward shape).
+
+    A=[M_total, K] @ B=[G, N, K].T → D=[M_total, N]
+    m_indices[M_total] selects which group each row belongs to (-1 = padding).
+    """
+    print('Test: m-grouped contiguous (MoE-style)')
+    BLOCK_M = 128
+
+    # Small/debug shapes — fast CPU LUT reference, exercise padding-row case.
+    debug_configs = [
+        (2, 128, 128,  256),
+        (4, 128, 128,  256),
+        (4, 128, 256,  512),
+        (4, 256, 128, 1024),
+        (8, 128, 256,  512),
+        # Uneven actual M per group, padded to BLOCK_M (exercises padding rows).
+        (4,  90, 128,  256),
+        (4, 200, 256,  512),
+    ]
+
+    # Production MoE shapes — mirror DeepGEMM official FP8 grouped (generators.py:105).
+    # CPU LUT reference takes a few seconds per shape at this size; OK for nightly.
+    prod_configs = [
+        (4, 8192, 4096, 7168),  # EP4, MoE up-projection
+        (4, 8192, 7168, 2048),  # EP4, MoE down-projection
+        (8, 4096, 4096, 7168),  # EP8, MoE up-projection
+        (8, 4096, 7168, 2048),  # EP8, MoE down-projection
+    ]
+
+    all_pass = True
+    for label, configs in [('debug', debug_configs), ('prod', prod_configs)]:
+        for num_groups, m_per_group, n, k in configs:
+            aligned_m = ((m_per_group + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+            m_total = aligned_m * num_groups
+
+            # Build A, B, m_indices
+            a = pack_fp4_random(m_total, k)
+            b = pack_fp4_random_3d(num_groups, n, k)
+            sf_a, _ = generate_mxf4_scale_factors(m_total, n, k, random_sf=True)
+            sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
+            m_indices = torch.empty(m_total, dtype=torch.int32, device='cuda')
+            for g in range(num_groups):
+                start = g * aligned_m
+                actual_end = start + m_per_group
+                aligned_end = start + aligned_m
+                m_indices[start:actual_end] = g
+                m_indices[actual_end:aligned_end] = -1
+
+            d = run_kernel_grouped(a, b, sf_a, sf_b, m_indices, m_total, n)
+            d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
+
+            ref = fp4_reference_grouped(a, b, m_indices, n, num_groups, sf_a, sf_b)
+            max_diff = torch.abs(d.cpu().float() - ref.float()).max().item()
+            ok = max_diff < 1.0
+            if not ok:
+                all_pass = False
+            print(f'  [{label}] G={num_groups} m_per_group={m_per_group:5d} '
+                  f'(aligned={aligned_m:5d}) N={n:5d} K_fp4={k:5d}: '
+                  f'max_diff={max_diff:.4f} {"PASS" if ok else "FAIL"}')
+
+    # Perf section — bench_kineto on production shapes only.
+    # Filter to the FP4 GEMM kernel name; works for both dense and grouped wrappers
+    # because the device kernel function is sm100_fp4_gemm_1d1d_impl in both cases.
+    print('\nPerf: m-grouped contiguous (production MoE shapes)')
+    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+    for num_groups, m_per_group, n, k in prod_configs:
+        aligned_m = ((m_per_group + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+        m_total = aligned_m * num_groups
+
+        a = pack_fp4_random(m_total, k)
+        b = pack_fp4_random_3d(num_groups, n, k)
+        sf_a, _ = generate_mxf4_scale_factors(m_total, n, k, random_sf=True)
+        sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
+        m_indices = torch.empty(m_total, dtype=torch.int32, device='cuda')
+        for g in range(num_groups):
+            start = g * aligned_m
+            m_indices[start:start + m_per_group] = g
+            m_indices[start + m_per_group:start + aligned_m] = -1
+        d = torch.empty((m_total, n), device='cuda', dtype=torch.float32)
+
+        def fn():
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                (a, sf_a), (b, sf_b), d, m_indices,
+                recipe=(1, 1, 128), disable_ue8m0_cast=duc,
+            )
+
+        t = bench_kineto(fn, 'sm100_fp4_gemm', suppress_kineto_output=True)
+        # FLOPs: 2 * M_total * N * K_fp4 (k here is K_fp4 element count).
+        # Bytes: A (int32, 4B/elem), B (int32, 4B/elem), D (fp32, 4B/elem), plus SF.
+        tflops = 2 * m_total * n * k / t / 1e12
+        gbps = count_bytes(a, b, d) / 1e9 / t
+        print(f'  G={num_groups} m_per_group={m_per_group:5d} N={n:5d} K_fp4={k:5d}: '
+              f'{t * 1e6:6.1f} us | {tflops:6.0f} TFLOPS | {gbps:5.0f} GB/s')
+
+    return all_pass
+
+
+def test_m_grouped_trtllm_comparable():
+    """trtllm-gen apples-to-apples: DeepSeek-R1 MoE setup with 256 experts × topK=8.
+
+    Setup mirrors gitlab/trtllm BatchedGemm baseline:
+      num_groups = 256 (numExperts)
+      total_actual_M = numTokens * topK = numTokens * 8
+      Uniform routing → rows_per_expert = total_actual_M / 256
+      Each expert tile padded to BLOCK_M=128
+
+    CAVEAT: trtllm-gen's BatchedGemmFp4LowLatency uses batch=N (grouped-along-N);
+    DG here uses batch=M. Memory access patterns differ but useful FLOPs compare directly.
+
+    trtllm-gen baseline on B200 (from memory/fp4_grouped_gemm_perf_work.md):
+
+      FC2 (N=7168, K=2048):
+        tokens=32   → 0.37 ms |  20.4 TFLOPS | 5.74 TB/s
+        tokens=64   → 0.37 ms |  40.7 TFLOPS | 5.75 TB/s
+        tokens=128  → 0.37 ms |  80.8 TFLOPS | 5.72 TB/s
+        tokens=256  → 0.37 ms | 161.9 TFLOPS | 5.78 TB/s
+        tokens=512  → 0.55 ms | 219.6 TFLOPS | 3.98 TB/s
+        tokens=1024 → 0.51 ms | 472.3 TFLOPS | 4.40 TB/s
+        tokens=2048 → 0.51 ms | 941.2 TFLOPS | 4.63 TB/s
+
+      FC1 (N=4096, K=7168, fusedAct=swiglu, routeAct=tma) — note batch=N caveat:
+        tokens=32   → 0.76 ms |  19.9 TFLOPS | 5.59 TB/s
+        tokens=64   → 0.75 ms |  39.8 TFLOPS | 5.61 TB/s
+        tokens=128  → 0.76 ms |  78.7 TFLOPS | 5.54 TB/s
+        tokens=256  → 0.76 ms | 157.5 TFLOPS | 5.55 TB/s
+        tokens=512  → 0.78 ms | 310.1 TFLOPS | 5.48 TB/s
+        tokens=1024 → 0.82 ms | 590.0 TFLOPS | 5.25 TB/s
+        tokens=2048 → 1.19 ms | 810.9 TFLOPS | 3.65 TB/s
+    """
+    print('Test: m-grouped contiguous (trtllm-gen comparable, 256 experts)')
+    BLOCK_M = 128
+    NUM_GROUPS = 256
+    TOP_K = 8
+
+    # Latency regime (trtllm-gen batch=N baseline): tokens 32..2048, per_group_M < BLOCK_M
+    # Throughput regime (trtllm-gen batch=M target): tokens 4096..8192, per_group_M >= BLOCK_M
+    # 4096: rows/grp=128 (= BLOCK_M, zero padding) — first apples-to-apples vs trtllm batch=M
+    # 8192: rows/grp=256 (= 2×BLOCK_M, 2 tiles per group)
+    token_sweep = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    shape_configs = [
+        ('FC2', 7168, 2048),
+        ('FC1', 4096, 7168),
+    ]
+
+    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+    all_pass = True
+
+    for fc_name, n, k in shape_configs:
+        print(f'\n--- {fc_name}: N={n}, K_fp4={k}, num_groups={NUM_GROUPS} ---')
+        # Allocate B/SFB once per shape (large, reuse across token sweep — independent of tokens)
+        b = pack_fp4_random_3d(NUM_GROUPS, n, k)
+        sf_b = generate_mxf4_sf_3d(NUM_GROUPS, n, k, random_sf=True)
+
+        for num_tokens in token_sweep:
+            total_actual_m = num_tokens * TOP_K
+            rows_per_group = max(1, total_actual_m // NUM_GROUPS)
+            # Per-group rows aligned UP to BLOCK_M (may exceed BLOCK_M for tokens >= 4096)
+            aligned_per_group = ((rows_per_group + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+            total_padded_m = NUM_GROUPS * aligned_per_group
+
+            # A/SF_A/D scale with total_padded_m, so allocate per iteration.
+            a = pack_fp4_random(total_padded_m, k)
+            sf_a, _ = generate_mxf4_scale_factors(total_padded_m, n, k, random_sf=True)
+            d = torch.empty((total_padded_m, n), device='cuda', dtype=torch.float32)
+
+            # m_indices: each group gets aligned_per_group rows, first rows_per_group are valid (g),
+            # remainder padding (-1).
+            m_indices = torch.full((total_padded_m,), -1, dtype=torch.int32, device='cuda')
+            for g in range(NUM_GROUPS):
+                start = g * aligned_per_group
+                m_indices[start:start + rows_per_group] = g
+                # rows [start + rows_per_group : start + aligned_per_group) stay -1
+
+            # Run kernel
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                (a, sf_a), (b, sf_b), d, m_indices,
+                recipe=(1, 1, 128), disable_ue8m0_cast=duc,
+            )
+            torch.cuda.synchronize()
+            d_clean = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
+
+            # Correctness: only for smaller tokens (CPU LUT reference for large M is slow)
+            if num_tokens <= 256:
+                ref = fp4_reference_grouped(a, b, m_indices, n, NUM_GROUPS, sf_a, sf_b)
+                max_diff = torch.abs(d_clean.cpu().float() - ref.float()).max().item()
+                ok = max_diff < 1.0
+                if not ok:
+                    all_pass = False
+                correctness = f'diff={max_diff:.4f} {"✓" if ok else "✗"}'
+            else:
+                correctness = '(skip)'
+
+            # Perf
+            def fn():
+                deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                    (a, sf_a), (b, sf_b), d, m_indices,
+                    recipe=(1, 1, 128), disable_ue8m0_cast=duc,
+                )
+            t = bench_kineto(fn, 'sm100_fp4_gemm', suppress_kineto_output=True)
+
+            # Useful FLOPS = 2 * useful_M * N * K (matches trtllm-gen convention)
+            useful_m = NUM_GROUPS * rows_per_group
+            useful_tflops = 2 * useful_m * n * k / t / 1e12
+            # Bytes: A loaded once (total_padded_m), B loaded once, D written once
+            gbps = count_bytes(a, b, d) / 1e9 / t
+            print(f'  tokens={num_tokens:5d} useful_M={useful_m:6d} '
+                  f'rows/grp={rows_per_group:4d}/{aligned_per_group:4d}: '
+                  f'{t * 1e3:6.3f} ms | {useful_tflops:7.1f} TFLOPS | '
+                  f'{gbps/1000:5.2f} TB/s | {correctness}')
+
+    return all_pass
+
+
 def test_multicast():
     """大 M 测试：触发 B-multicast (M>=512, 2CTA along M, UMMA_M=256)"""
     print('Test: B-multicast (M>=512, 2CTA)')
@@ -324,6 +593,8 @@ if __name__ == '__main__':
         ('uniform_sf',     test_uniform_sf()),
         ('random_sf',      test_random_sf()),
         ('multicast',      test_multicast()),
+        ('m_grouped',      test_m_grouped_contiguous()),
+        ('trtllm_cmp',     test_m_grouped_trtllm_comparable()),
     ]
 
     print()

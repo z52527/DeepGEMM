@@ -189,4 +189,77 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     SM100FP4Gemm1D1DRuntime::launch(runtime, args);
 }
 
+static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                     const torch::Tensor& b, const torch::Tensor& sfb,
+                                                     const torch::Tensor& d,
+                                                     const torch::Tensor& m_indices,
+                                                     const int& num_groups, const int& m, const int& n, const int& k,
+                                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                                     const std::string& compiled_dims) {
+    // FP4 packed: K is int32 count; align to 32 int32 (= 128 bytes = BLOCK_K)
+    const auto& aligned_k = align(k, 32);
+
+    // Zero-pad A/B along K to aligned_k if needed (TMA OOB_FILL_NONE on int32).
+    // A: [M, K] → [M, aligned_K]. B: [G, N, K] → [G, N, aligned_K].
+    auto a_work = a;
+    auto b_work = b;
+    int k_work = k;
+    if (k < aligned_k) {
+        a_work = torch::zeros({m, aligned_k}, a.options());
+        a_work.slice(1, 0, k).copy_(a);
+        b_work = torch::zeros({num_groups, n, aligned_k}, b.options());
+        b_work.slice(2, 0, k).copy_(b);
+        k_work = aligned_k;
+    }
+
+    const auto& config = get_best_fp4_config(GemmType::MGroupedContiguous,
+                                             m, n, k, 1, major_a, major_b,
+                                             d.scalar_type(), false,
+                                             device_runtime->get_num_sms());
+
+    // Create tensor descriptors. B carries num_groups in the outer dim;
+    // A is 2D since the M-dim is already concatenated across groups (m_indices selects the group per row).
+    const auto& tensor_map_a = make_tma_a_desc(major_a, a_work, m, k_work,
+                                               SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
+                                               config.block_k,
+                                               static_cast<int>(a_work.stride(get_non_contiguous_dim(major_a))), 1,
+                                               config.smem_config.swizzle_a_mode);
+    const auto& tensor_map_b = make_tma_b_desc(major_b, b_work, n, k_work,
+                                               SM100ArchSpec::get_ab_load_block_n(config.multicast_config, config.block_n),
+                                               config.block_k,
+                                               static_cast<int>(b_work.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                               config.smem_config.swizzle_b_mode);
+    const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
+                                                SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                                SM100ArchSpec::get_cd_store_block_n(config.block_n),
+                                                static_cast<int>(d.stride(-2)), 1,
+                                                config.smem_config.swizzle_cd_mode);
+    // FP4 SF: sf_block_k = 4 (int32 unit), not config.block_k
+    const int sf_block_k = 4;
+    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                  config.block_m, sf_block_k, 1, 0);
+    const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                  config.block_n, sf_block_k, num_groups, 0);
+
+    const SM100FP4Gemm1D1DRuntime::Args& args = {
+        .m = m, .n = n, .k = aligned_k,
+        .num_groups = num_groups,
+        .compiled_dims = compiled_dims,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+                                  config.smem_config.smem_size,
+                                  config.multicast_config.num_multicast),
+        .grouped_layout = m_indices.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
+        .tensor_map_c = tensor_map_d,
+        .tensor_map_d = tensor_map_d
+    };
+    const auto& code = SM100FP4Gemm1D1DRuntime::generate(args);
+    const auto& runtime = compiler->build("sm100_m_grouped_fp4_gemm_contiguous_1d1d", code);
+    SM100FP4Gemm1D1DRuntime::launch(runtime, args);
+}
+
 } // namespace deep_gemm
