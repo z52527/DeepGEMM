@@ -410,6 +410,9 @@ def test_m_grouped_contiguous():
         # Uneven actual M per group, padded to BLOCK_M (exercises padding rows).
         (4,  90, 128,  256),
         (4, 200, 256,  512),
+        # Extra N×K variety to exercise more BLOCK_N choices and SF transform paths.
+        (4, 128,  512,  256),
+        (4, 128,  768,  256),
     ]
 
     # Production MoE shapes — mirror DeepGEMM official FP8 grouped (generators.py:105).
@@ -419,7 +422,15 @@ def test_m_grouped_contiguous():
         (4, 8192, 7168, 2048),  # EP4, MoE down-projection
         (8, 4096, 4096, 7168),  # EP8, MoE up-projection
         (8, 4096, 7168, 2048),  # EP8, MoE down-projection
+        # Extra (n, k) variants from FP8 enumerate_normal for N/K coverage:
+        (4, 8192, 24576, 1536),
+        (4, 8192, 32768,  512),
     ]
+
+    # Mirror FP8 masked-test pattern: multiple random-data iterations per shape to
+    # catch flaky bugs that only show up with certain RNG seeds. Debug shapes get
+    # fewer iters (kept fast); prod shapes get 3 iters each.
+    NUM_ITERS = {'debug': 2, 'prod': 3}
 
     all_pass = True
     for label, configs in [('debug', debug_configs), ('prod', prod_configs)]:
@@ -427,30 +438,35 @@ def test_m_grouped_contiguous():
             aligned_m = ((m_per_group + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
             m_total = aligned_m * num_groups
 
-            # Build A, B, m_indices
-            a = pack_fp4_random(m_total, k)
-            b = pack_fp4_random_3d(num_groups, n, k)
-            sf_a, _ = generate_mxf4_scale_factors(m_total, n, k, random_sf=True)
-            sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
-            m_indices = torch.empty(m_total, dtype=torch.int32, device='cuda')
-            for g in range(num_groups):
-                start = g * aligned_m
-                actual_end = start + m_per_group
-                aligned_end = start + aligned_m
-                m_indices[start:actual_end] = g
-                m_indices[actual_end:aligned_end] = -1
+            worst_diff = 0.0
+            for _ in range(NUM_ITERS[label]):
+                # Build A, B, m_indices fresh per iteration
+                a = pack_fp4_random(m_total, k)
+                b = pack_fp4_random_3d(num_groups, n, k)
+                sf_a, _ = generate_mxf4_scale_factors(m_total, n, k, random_sf=True)
+                sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
+                m_indices = torch.empty(m_total, dtype=torch.int32, device='cuda')
+                for g in range(num_groups):
+                    start = g * aligned_m
+                    actual_end = start + m_per_group
+                    aligned_end = start + aligned_m
+                    m_indices[start:actual_end] = g
+                    m_indices[actual_end:aligned_end] = -1
 
-            d = run_kernel_grouped(a, b, sf_a, sf_b, m_indices, m_total, n)
-            d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
+                d = run_kernel_grouped(a, b, sf_a, sf_b, m_indices, m_total, n)
+                d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
 
-            ref = fp4_reference_grouped(a, b, m_indices, n, num_groups, sf_a, sf_b)
-            max_diff = torch.abs(d.cpu().float() - ref.float()).max().item()
-            ok = max_diff < 1.0
+                ref = fp4_reference_grouped(a, b, m_indices, n, num_groups, sf_a, sf_b)
+                d_max = torch.abs(d.cpu().float() - ref.float()).max().item()
+                if d_max > worst_diff:
+                    worst_diff = d_max
+
+            ok = worst_diff < 1.0
             if not ok:
                 all_pass = False
-            print(f'  [{label}] G={num_groups} m_per_group={m_per_group:5d} '
+            print(f'  [{label}×{NUM_ITERS[label]}] G={num_groups} m_per_group={m_per_group:5d} '
                   f'(aligned={aligned_m:5d}) N={n:5d} K_fp4={k:5d}: '
-                  f'max_diff={max_diff:.4f} {"PASS" if ok else "FAIL"}')
+                  f'max_diff={worst_diff:.4f} {"PASS" if ok else "FAIL"}')
 
     # Perf section — bench_kineto on production shapes only.
     # Filter to the FP4 GEMM kernel name; works for both dense and grouped wrappers
@@ -615,52 +631,65 @@ def test_m_grouped_masked():
     BLOCK_M = 128
 
     # (num_groups, max_m, expected_m, n, k_fp4)
-    # Small/debug shapes first (CPU reference still fast).
-    configs = [
-        (2,  128,  64, 128,  256),   # 64 valid out of 128
-        (4,  128,  32, 128,  256),   # heavy padding
-        (4,  256, 200, 128,  256),
-        (4,  128, 128, 256,  512),   # full
+    # Small/debug shapes (CPU reference fast) + production shapes mirroring FP8 enumerate_m_grouped_masked
+    debug_configs = [
+        (2,  128,  64, 128,  256),    # 50% util
+        (4,  128,  32, 128,  256),    # heavy padding
+        (4,  256, 200, 128,  256),    # multi-tile per group
+        (4,  128, 128, 256,  512),    # full
         (8,  128,  64, 256,  512),
-        # Production-scale (matching FP8 enumerate_m_grouped_masked-style):
-        (4, 4096, 1024, 4096, 7168), # max_m=4096, ~25% utilization
-        (4, 4096, 1024, 7168, 2048),
     ]
+    prod_configs = [
+        # max_m=4096 (matching FP8 enumerate_m_grouped_masked max_m), varying num_groups & m
+        (1, 4096, 1024, 4096, 7168),  # FP8 (1, 1024)
+        (2, 4096,  512, 4096, 7168),  # FP8 (2, 512)
+        (4, 4096,  256, 4096, 7168),  # FP8 (4, 256)
+        (1, 4096, 1024, 7168, 2048),
+        (2, 4096,  512, 7168, 2048),
+        (4, 4096,  256, 7168, 2048),
+    ]
+
+    # Mirror FP8 test_m_grouped_gemm_masked: 10 random-data iterations per shape on
+    # production shapes to catch flaky bugs (different masked_m distribution each time).
+    NUM_ITERS = {'debug': 3, 'prod': 10}
+
     all_pass = True
     duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
-    for num_groups, max_m, expected_m, n, k in configs:
-        # masked_m: random per-group valid counts around expected_m (within [1, max_m])
-        masked_m_cpu = torch.tensor([
-            max(1, min(max_m, int(expected_m * random.uniform(0.7, 1.3))))
-            for _ in range(num_groups)
-        ], dtype=torch.int32)
-        masked_m = masked_m_cpu.cuda()
+    for label, configs in [('debug', debug_configs), ('prod', prod_configs)]:
+        for num_groups, max_m, expected_m, n, k in configs:
+            worst_diff = 0.0
+            for _ in range(NUM_ITERS[label]):
+                # Fresh masked_m + tensors per iteration (matches FP8 pattern)
+                masked_m_cpu = torch.tensor([
+                    max(1, min(max_m, int(expected_m * random.uniform(0.7, 1.3))))
+                    for _ in range(num_groups)
+                ], dtype=torch.int32)
+                masked_m = masked_m_cpu.cuda()
 
-        a = pack_fp4_random_3d_ga(num_groups, max_m, k)
-        b = pack_fp4_random_3d(num_groups, n, k)
-        sf_a = generate_mxf4_sfa_3d(num_groups, max_m, k, random_sf=True)
-        sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
+                a = pack_fp4_random_3d_ga(num_groups, max_m, k)
+                b = pack_fp4_random_3d(num_groups, n, k)
+                sf_a = generate_mxf4_sfa_3d(num_groups, max_m, k, random_sf=True)
+                sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
 
-        d = run_kernel_grouped_masked(a, b, sf_a, sf_b, masked_m, num_groups,
-                                      max_m, n, expected_m)
-        ref = fp4_reference_masked(a, b, masked_m_cpu, max_m, n, num_groups, sf_a, sf_b)
+                d = run_kernel_grouped_masked(a, b, sf_a, sf_b, masked_m, num_groups,
+                                              max_m, n, expected_m)
+                ref = fp4_reference_masked(a, b, masked_m_cpu, max_m, n, num_groups, sf_a, sf_b)
 
-        # Only compare the valid rows per group.
-        max_diff = 0.0
-        for g in range(num_groups):
-            mg = int(masked_m_cpu[g].item())
-            if mg == 0:
-                continue
-            diff = torch.abs(d[g, :mg].cpu().float() - ref[g, :mg].float()).max().item()
-            if diff > max_diff:
-                max_diff = diff
-        ok = max_diff < 1.0
-        if not ok:
-            all_pass = False
-        total_valid = int(masked_m_cpu.sum().item())
-        print(f'  G={num_groups} max_m={max_m:5d} expected_m={expected_m:5d} '
-              f'(valid_sum={total_valid:5d}) N={n:5d} K_fp4={k:5d}: '
-              f'max_diff={max_diff:.4f} {"PASS" if ok else "FAIL"}')
+                # Only compare valid rows per group
+                for g in range(num_groups):
+                    mg = int(masked_m_cpu[g].item())
+                    if mg == 0:
+                        continue
+                    diff = torch.abs(d[g, :mg].cpu().float() - ref[g, :mg].float()).max().item()
+                    if diff > worst_diff:
+                        worst_diff = diff
+
+            ok = worst_diff < 1.0
+            if not ok:
+                all_pass = False
+            print(f'  [{label}×{NUM_ITERS[label]}] G={num_groups} max_m={max_m:5d} '
+                  f'expected_m={expected_m:5d} N={n:5d} K_fp4={k:5d}: '
+                  f'max_diff={worst_diff:.4f} {"PASS" if ok else "FAIL"}')
 
     return all_pass
 
