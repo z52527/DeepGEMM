@@ -171,6 +171,59 @@ def run_kernel_grouped(a_packed, b_packed, sf_a, sf_b, m_indices, m, n, recipe=(
     return d
 
 
+def pack_fp4_random_3d_ga(num_groups: int, max_m: int, k_fp4: int, device='cuda'):
+    """生成 [G, max_M, K_int32] FP4 packed tensor (A side for masked variant)."""
+    assert k_fp4 % 8 == 0
+    raw = torch.randint(0, 16, (num_groups, max_m, k_fp4), dtype=torch.uint8, device=device)
+    packed = torch.zeros(num_groups, max_m, k_fp4 // 8, dtype=torch.int32, device=device)
+    for i in range(8):
+        packed += (raw[:, :, i::8].to(torch.int32) << (i * 4))
+    return packed
+
+
+def generate_mxf4_sfa_3d(num_groups: int, max_m: int, k_fp4: int, device='cuda', random_sf=False):
+    """生成 SFA [G, max_M, sf_k] for grouped masked."""
+    VS = 32
+    sf_k = ((k_fp4 // VS + 3) // 4) * 4
+    if random_sf:
+        powers = torch.randint(-2, 3, (num_groups, max_m, sf_k), device=device).float()
+        return torch.pow(2.0, powers)
+    return torch.ones((num_groups, max_m, sf_k), dtype=torch.float32, device=device)
+
+
+def fp4_reference_masked(a_3d, b_3d, masked_m_cpu, max_m, n, num_groups,
+                         sf_a_3d=None, sf_b_3d=None):
+    """Reference for masked variant: D[g, :masked_m[g], :] = A[g, :masked_m[g], :] @ B[g, :, :].T.
+
+    Padding rows beyond masked_m[g] in D are not checked (kernel may leave any value).
+    Returns d_ref of shape [G, max_M, N] with valid rows filled, padding rows zeroed.
+    """
+    d_ref = torch.zeros(num_groups, max_m, n, dtype=torch.float32)
+    for g in range(num_groups):
+        mg = int(masked_m_cpu[g].item())
+        if mg == 0:
+            continue
+        a_g = a_3d[g, :mg]
+        sf_a_g = sf_a_3d[g, :mg] if sf_a_3d is not None else None
+        sf_b_g = sf_b_3d[g] if sf_b_3d is not None else None
+        c_g = fp4_reference(a_g, b_3d[g], mg, n, sf_a_g, sf_b_g)
+        d_ref[g, :mg] = c_g
+    return d_ref
+
+
+def run_kernel_grouped_masked(a_3d, b_3d, sf_a_3d, sf_b_3d, masked_m, num_groups,
+                              max_m, n, expected_m, recipe=(1, 1, 128)):
+    """调用 m_grouped_fp8_gemm_nt_masked FP4 路径。"""
+    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+    d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.float32)
+    deep_gemm.m_grouped_fp8_gemm_nt_masked(
+        (a_3d, sf_a_3d), (b_3d, sf_b_3d), d, masked_m, expected_m,
+        recipe=recipe, disable_ue8m0_cast=duc,
+    )
+    torch.cuda.synchronize()
+    return d
+
+
 # ============================================================
 # 测试用例
 # ============================================================
@@ -552,6 +605,66 @@ def test_m_grouped_trtllm_comparable():
     return all_pass
 
 
+def test_m_grouped_masked():
+    """M-grouped masked FP4 GEMM (MoE decode shape).
+
+    A=[G, max_M, K] @ B=[G, N, K].T → D=[G, max_M, N]
+    masked_m[G] indicates the number of valid rows per group (rest is padding).
+    """
+    print('Test: m-grouped masked (MoE decode)')
+    BLOCK_M = 128
+
+    # (num_groups, max_m, expected_m, n, k_fp4)
+    # Small/debug shapes first (CPU reference still fast).
+    configs = [
+        (2,  128,  64, 128,  256),   # 64 valid out of 128
+        (4,  128,  32, 128,  256),   # heavy padding
+        (4,  256, 200, 128,  256),
+        (4,  128, 128, 256,  512),   # full
+        (8,  128,  64, 256,  512),
+        # Production-scale (matching FP8 enumerate_m_grouped_masked-style):
+        (4, 4096, 1024, 4096, 7168), # max_m=4096, ~25% utilization
+        (4, 4096, 1024, 7168, 2048),
+    ]
+    all_pass = True
+    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+    for num_groups, max_m, expected_m, n, k in configs:
+        # masked_m: random per-group valid counts around expected_m (within [1, max_m])
+        masked_m_cpu = torch.tensor([
+            max(1, min(max_m, int(expected_m * random.uniform(0.7, 1.3))))
+            for _ in range(num_groups)
+        ], dtype=torch.int32)
+        masked_m = masked_m_cpu.cuda()
+
+        a = pack_fp4_random_3d_ga(num_groups, max_m, k)
+        b = pack_fp4_random_3d(num_groups, n, k)
+        sf_a = generate_mxf4_sfa_3d(num_groups, max_m, k, random_sf=True)
+        sf_b = generate_mxf4_sf_3d(num_groups, n, k, random_sf=True)
+
+        d = run_kernel_grouped_masked(a, b, sf_a, sf_b, masked_m, num_groups,
+                                      max_m, n, expected_m)
+        ref = fp4_reference_masked(a, b, masked_m_cpu, max_m, n, num_groups, sf_a, sf_b)
+
+        # Only compare the valid rows per group.
+        max_diff = 0.0
+        for g in range(num_groups):
+            mg = int(masked_m_cpu[g].item())
+            if mg == 0:
+                continue
+            diff = torch.abs(d[g, :mg].cpu().float() - ref[g, :mg].float()).max().item()
+            if diff > max_diff:
+                max_diff = diff
+        ok = max_diff < 1.0
+        if not ok:
+            all_pass = False
+        total_valid = int(masked_m_cpu.sum().item())
+        print(f'  G={num_groups} max_m={max_m:5d} expected_m={expected_m:5d} '
+              f'(valid_sum={total_valid:5d}) N={n:5d} K_fp4={k:5d}: '
+              f'max_diff={max_diff:.4f} {"PASS" if ok else "FAIL"}')
+
+    return all_pass
+
+
 def test_multicast():
     """大 M 测试：触发 B-multicast (M>=512, 2CTA along M, UMMA_M=256)"""
     print('Test: B-multicast (M>=512, 2CTA)')
@@ -594,6 +707,7 @@ if __name__ == '__main__':
         ('random_sf',      test_random_sf()),
         ('multicast',      test_multicast()),
         ('m_grouped',      test_m_grouped_contiguous()),
+        ('m_grouped_masked', test_m_grouped_masked()),
         ('trtllm_cmp',     test_m_grouped_trtllm_comparable()),
     ]
 

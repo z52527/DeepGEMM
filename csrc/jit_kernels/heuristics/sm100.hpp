@@ -297,8 +297,13 @@ static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
     // many BLOCK_M tiles have padding (effective_m < BLOCK_M). When per-group M >= BLOCK_M
     // (= 128), each tile is fully utilized → swap_ab's 8× small-store overhead is pure
     // loss. Gate on expected_m_per_group < BLOCK_M.
+    //
+    // NOTE: v0 only enables swap_ab for MGroupedContiguous. Swap_ab + MGroupedMasked
+    // currently produces NaN/inf for partial-tile cases (max_m <= BLOCK_M with
+    // masked_m < BLOCK_M); the interaction needs further debugging. Masked path stays
+    // on the non-swap kernel for now.
     bool swap_ab = false;
-    if ((gemm_type == GemmType::MGroupedContiguous || gemm_type == GemmType::MGroupedMasked)
+    if (gemm_type == GemmType::MGroupedContiguous
         && expected_m_per_group < block_m) {
         swap_ab = true;
         best_block_n = 128;          // Kernel static_assert: kSwapAB requires BLOCK_N = LAYOUT_AD_M
