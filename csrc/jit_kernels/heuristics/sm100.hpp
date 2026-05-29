@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.hpp>
@@ -36,6 +38,7 @@ struct SM100ArchSpec {
         switch (ab_dtype) {
             case torch::kBFloat16: return {0, 0};
             case torch::kFloat8_e4m3fn: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case torch::kInt: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};  // FP4 packed data
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
@@ -68,7 +71,9 @@ struct SM100ArchSpec {
             const auto& [sf_block_m_, sf_block_n_] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
             sf_block_m = sf_block_m_, sf_block_n = sf_block_n_;
         }
-        if (((2 * block_n) + (sf_block_m / 32) + (sf_block_n / 32)) > 512)
+        // FP4: sf_packed_k_per_stage = block_k * 8 / 32 / 4 = block_k / 16
+        const int sf_tmem_k_mult = (ab_dtype == torch::kInt) ? (block_k / 16) : 1;
+        if (((2 * block_n) + (sf_block_m / 32) * sf_tmem_k_mult + (sf_block_n / 32) * sf_tmem_k_mult) > 512)
             return false;
 
         // NOTES: when B is MN-major, we restrict `block_n` to multiples of 64,
@@ -89,7 +94,9 @@ struct SM100ArchSpec {
     static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type,
                                                       const int& m, const int& n, const int& block_m, const int& block_n,
                                                       const int& num_sms) {
-        // TODO: support other layouts
+        // B-multicast: FP8 supports it (UMMA_M=256 ok for MXF8).
+        // FP4 doesn't reach here (dispatched to sm100_fp4_gemm_1d1d which uses its own config with torch::kInt).
+        // A-multicast: blocked by kernel static assert.
         return {
             false,
             is_multicast_legal(m, block_m, 2, num_sms, true) and (gemm_type == GemmType::Normal or gemm_type == GemmType::KGroupedContiguous),
@@ -119,8 +126,9 @@ struct SM100ArchSpec {
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
-            smem_sfa_per_stage = sf_block_m * 4;
-            smem_sfb_per_stage = sf_block_n * 4;
+            const int sf_packed_k_per_stage = (ab_dtype == torch::kInt) ? (block_k / 16) : 1;
+            smem_sfa_per_stage = sf_block_m * 4 * sf_packed_k_per_stage;
+            smem_sfb_per_stage = sf_block_n * 4 * sf_packed_k_per_stage;
         } else {
             smem_sfa_per_stage = block_m * 4;
             smem_sfb_per_stage = 0;
@@ -145,5 +153,217 @@ struct SM100ArchSpec {
         return 4;
     }
 };
+
+// ============================================================
+// FP4-specific heuristic for SM100
+// ============================================================
+// FP4 (MXF4 E2M1) has tighter hardware constraints than FP8:
+//   - BLOCK_M is fixed to 128 (UMMA_M=128 for MXF4 2-CTA MMA)
+//   - BLOCK_K is fixed to 32 int32 (= 256 FP4 elements = 128 bytes)
+//   - No multicast (MXF4 2-CTA MMA only supports M=128)
+//   - SF occupies 2x TMEM columns vs FP8 (sf_packed_k_per_stage=2)
+//   - TMEM capacity limits max BLOCK_N to ~240
+//
+// Strategy: same wave-minimization as FP8, but with a much narrower
+// search space (only BLOCK_N varies). Tie-breaking favors smaller
+// BLOCK_N to reduce wasted computation, since FP4's high arithmetic
+// intensity means we're less sensitive to launch overhead.
+
+// `expected_m_per_group`: typical valid-row count per BLOCK_M tile. Only consulted for
+//   m-grouped types to decide whether swap_ab's effective-M epilogue would pay off
+//   (small per-group M → lots of padding → swap_ab wins; large per-group M → padding
+//   ≈0 → swap_ab's 8× small-store overhead wins). Default `INT_MAX` keeps swap_ab off.
+static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
+                                      const int& m, const int& n, const int& k, const int& num_groups,
+                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                      const at::ScalarType& cd_dtype,
+                                      const bool& with_accumulation, const int& num_sms,
+                                      const int& expected_m_per_group = std::numeric_limits<int>::max()) {
+    constexpr auto ab_dtype = at::kInt;  // FP4 packed as int32
+    constexpr auto kernel_type = KernelType::Kernel1D1D;
+    constexpr int block_m = 128;   // MXF4 UMMA_M is always 128
+    constexpr int block_k = 32;    // 128 bytes / sizeof(int32) = 32 (256 FP4 per stage)
+
+    // Build candidate BLOCK_N list with legality check
+    // TMEM constraint: epilogue_stages*BN + (SF_BLOCK_M/32)*sf_pk + (SF_BLOCK_N/32)*sf_pk <= 512
+    // sf_pk = block_k / 16 (SF_PACKED_K_PER_STAGE)
+    constexpr int sf_pk = block_k / 16;
+    constexpr int sf_block_m_cols = (128 / 32) * sf_pk;
+    auto is_fp4_block_n_legal = [&](const int& block_n) -> bool {
+        if (block_n % 16 != 0 || block_n < 16 || block_n > 256)
+            return false;
+        // N%bn!=0 is OK: B TMA OOB columns read garbage but TMA store drops OOB writes.
+        // SFB SMEM padding handled by zero-fill before warp-transpose.
+        if (major_b != cute::UMMA::Major::K && (block_n * static_cast<int>(c10::elementSize(ab_dtype))) % 64 != 0)
+            return false;
+        // TMEM capacity: kernel auto-reduces epilogue stages from 2 to 1 if needed
+        const int sf_block_n = align(block_n, 128);
+        const int sf_block_n_cols = (sf_block_n / 32) * sf_pk;
+        // Check with 1 epilogue stage (minimum)
+        if ((1 * block_n + sf_block_m_cols + sf_block_n_cols) > 512)
+            return false;
+        return true;
+    };
+
+    // Wave-based block_n selection (same logic as FP8 but only block_n varies)
+    const auto get_num_blocks = [=](const int& bn) {
+        return ceil_div(m, block_m) * ceil_div(n, bn) * num_groups;
+    };
+    const auto get_num_waves = [=](const int& bn) {
+        return ceil_div(get_num_blocks(bn), num_sms);
+    };
+    const auto get_last_wave_util = [=](const int& bn) {
+        const auto num_last = get_num_blocks(bn) % num_sms;
+        return num_last == 0 ? num_sms : num_last;
+    };
+
+    // TMEM double-buffer feasibility: kernel sets kNumEpilogueStages=2 when
+    // 2*BN + SFA_cols + SFB_cols <= 512, else 1. Two epi stages enable
+    // concurrent MMA/epilogue on different TMEM halves (Modular Part 4 K8),
+    // giving ~6-15% perf on large tiles. Treat it as a tiebreaker within the
+    // same wave count — prefer 2-stage capable BN over 1-stage BN.
+    auto fits_2_epi_stages = [&](int bn) {
+        const int sf_block_n = align(bn, 128);
+        const int sf_block_n_cols = (sf_block_n / 32) * sf_pk;
+        return (2 * bn + sf_block_m_cols + sf_block_n_cols) <= 512;
+    };
+
+    int best_block_n = 0;
+    int best_num_waves = 0, best_score = 0;
+    bool best_fits_2epi = false;
+    for (int bn = 16; bn <= 256; bn += 16) {
+        if (!is_fp4_block_n_legal(bn))
+            continue;
+
+        const int num_waves = get_num_waves(bn);
+
+        // Estimate pipeline stages for this block_n (conservative: no multicast for smem estimate)
+        const int per_stage_approx = block_m * block_k * 4 + bn * block_k * 4
+                                   + 128 * sf_pk * 4 + align(bn, 128) * sf_pk * 4;
+        const int avail_smem = SM100ArchSpec::smem_capacity - 32768 - 200;
+        const int est_stages = std::min(12, std::max(1, avail_smem / per_stage_approx));
+
+        // Composite score: stages² × bn balances pipeline depth vs tile size.
+        // Squared stages penalizes low pipeline depth, matching empirical sweep data.
+        const int score = est_stages * est_stages * bn;
+        const bool cur_fits_2epi = fits_2_epi_stages(bn);
+
+        // TMEM double-buffer benefit only materializes when each SM processes
+        // >=2 tiles — the kernel alternates accum_stage_idx across iterations
+        // of scheduler.current_iter, so single-wave shapes see no overlap
+        // between tile epilogue and next tile MMA. Empirically verified:
+        //   1024x4096x7168 (1 wave): bn=256/1-epi (2330T) beats bn=240/2-epi (2314T)
+        //   4096x4096x7168 (4 waves): bn=240/2-epi (3871T) beats bn=256/1-epi (3621T)
+        const bool consider_epi = num_waves >= 2;
+
+        bool success = false;
+        if (best_block_n == 0 || num_waves < best_num_waves) {
+            success = true;
+        } else if (num_waves == best_num_waves && bn <= n) {
+            // Tiebreak 1 (multi-wave only): prefer BN enabling 2 epi stages.
+            if (consider_epi && cur_fits_2epi && !best_fits_2epi) {
+                success = true;
+            // Tiebreak 2: single-wave or same epi-status → pure score.
+            } else if ((!consider_epi || cur_fits_2epi == best_fits_2epi) && score > best_score) {
+                success = true;
+            }
+        }
+
+        if (success) {
+            best_block_n = bn;
+            best_num_waves = num_waves;
+            best_score = score;
+            best_fits_2epi = cur_fits_2epi;
+        }
+    }
+    DG_HOST_ASSERT(best_block_n > 0);
+
+    // Allow env override for benchmarking
+    if (const auto env_bn = get_env<int>("DG_FP4_BLOCK_N"); env_bn > 0) {
+        DG_HOST_ASSERT(env_bn % 16 == 0 && env_bn <= 256);
+        best_block_n = env_bn;
+    }
+
+    // B-multicast for FP4: 2CTA along M, UMMA_M=256, each CTA loads half of B
+    // A-multicast is not supported (2x1SM distributes along M only)
+    MulticastConfig multicast_config = {1, false};
+    if (m >= 512
+        && is_multicast_legal(m, block_m, 2, num_sms, true)
+        && (gemm_type == GemmType::Normal || gemm_type == GemmType::KGroupedContiguous)) {
+        multicast_config = {2, false};  // B-multicast
+    }
+
+    // Swap-AB for m-grouped FP4: only beneficial when per-group M is small enough that
+    // many BLOCK_M tiles have padding (effective_m < BLOCK_M). When per-group M >= BLOCK_M
+    // (= 128), each tile is fully utilized → swap_ab's 8× small-store overhead is pure
+    // loss. Gate on expected_m_per_group < BLOCK_M.
+    //
+    // NOTE: v0 only enables swap_ab for MGroupedContiguous. Swap_ab + MGroupedMasked
+    // currently produces NaN/inf for partial-tile cases (max_m <= BLOCK_M with
+    // masked_m < BLOCK_M); the interaction needs further debugging. Masked path stays
+    // on the non-swap kernel for now.
+    bool swap_ab = false;
+    if (gemm_type == GemmType::MGroupedContiguous
+        && expected_m_per_group < block_m) {
+        swap_ab = true;
+        best_block_n = 128;          // Kernel static_assert: kSwapAB requires BLOCK_N = LAYOUT_AD_M
+        multicast_config = {1, false};  // v0: disable multicast under swap_ab
+    }
+
+    // Find max pipeline stages that fit in shared memory
+    constexpr int smem_capacity = SM100ArchSpec::smem_capacity;
+    int best_num_stages = 0;
+    SharedMemoryConfig best_smem_config;
+    for (int num_stages = std::min(12, ceil_div(k, block_k)); num_stages > 0; --num_stages) {
+        best_smem_config = get_smem_config<SM100ArchSpec>(kernel_type,
+                                                          m, n, k,
+                                                          block_m, best_block_n, block_k,
+                                                          major_a, major_b,
+                                                          ab_dtype, cd_dtype,
+                                                          num_stages, multicast_config);
+        if (best_smem_config.smem_size <= smem_capacity) {
+            best_num_stages = num_stages;
+            break;
+        }
+    }
+    DG_HOST_ASSERT(best_num_stages != 0);
+
+    const auto config = GemmConfig {
+        .gemm_type = gemm_type,
+        .kernel_type = kernel_type,
+        .ab_dtype = ab_dtype,
+        .cd_dtype = cd_dtype,
+        .major_a = major_a,
+        .major_b = major_b,
+        .with_accumulation = with_accumulation,
+        .block_m = block_m,
+        .block_n = best_block_n,
+        .block_k = block_k,
+        .num_stages = best_num_stages,
+        .num_last_stages = ceil_div(k, block_k) % best_num_stages,
+        .num_sms = num_sms,
+        .tc_util = device_runtime->get_tc_util(),
+        .swap_ab = swap_ab,
+        .multicast_config = multicast_config,
+        .smem_config = best_smem_config,
+        .thread_config = SM100ArchSpec::get_thread_config(kernel_type, block_m, best_block_n)
+    };
+
+    // Print config
+    if (get_env<int>("DG_JIT_DEBUG") || get_env<int>("DG_PRINT_CONFIGS")) {
+        auto key = std::make_tuple(gemm_type, m, n, k, num_groups);
+        static std::set<decltype(key)> printed;
+        if (printed.count(key) == 0) {
+            printf("FP4 GEMM: M: %d, N: %d, K: %d, groups: %d -> "
+                   "block N: %d, stages: %d, last stages: %d, "
+                   "shared memory: %d bytes, SMs: %d\n",
+                   m, n, k, num_groups, best_block_n,
+                   best_num_stages, config.num_last_stages,
+                   best_smem_config.smem_size, num_sms);
+            printed.insert(key);
+        }
+    }
+    return config;
+}
 
 } // namespace deep_gemm

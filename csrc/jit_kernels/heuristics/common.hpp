@@ -67,6 +67,12 @@ struct GemmConfig {
     int num_sms;
     int tc_util;
 
+    // Swap-AB flag: when true, kernel computes D^T = B @ A^T (swapping operand roles
+    // at MMA level + transposed epilogue). Enables A-multicast / effective-M skipping
+    // for m-grouped GEMMs where M-tiles can belong to different groups.
+    // See tests/swap_ab_porting_guide.md for context.
+    bool swap_ab = false;
+
     // Structured configs
     MulticastConfig multicast_config;
     SharedMemoryConfig smem_config;
@@ -147,7 +153,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
                                   const bool& with_accumulation, const int& num_sms) {
-    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
+    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16 or ab_dtype == torch::kInt);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
@@ -213,11 +219,17 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     }
     DG_HOST_ASSERT(best_block_m > 0 and best_block_n > 0);
 
+    // Allow overriding block_n via env var for benchmarking/testing
+    if (const auto env_bn = get_env<int>("DG_FP4_BLOCK_N"); env_bn > 0 and ab_dtype == torch::kInt) {
+        DG_HOST_ASSERT(env_bn % 16 == 0 and env_bn <= 256);
+        best_block_n = env_bn;
+    }
+
     // Decide the number of TMA multicasts and whether broadcast on A
     MulticastConfig best_multicast_config = {1, true};
     const auto& [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
         gemm_type, m, n, best_block_m, best_block_n, num_sms);
-    const bool is_legal[2] = {is_legal_on_b, is_legal_on_a};
+    const bool is_legal[2] = {is_legal_on_a, is_legal_on_b};
     bool order[2] = {false, true};
     if (best_block_m > best_block_n)
         std::swap(order[0], order[1]);
@@ -257,7 +269,6 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
     }
-
     const auto& config = GemmConfig {
         .gemm_type = gemm_type,
         .kernel_type = kernel_type,

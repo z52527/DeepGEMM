@@ -141,7 +141,75 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
                               stride_byte_offset, leading_byte_offset);
     }
 }
+template <
+    cute::UMMA::Major kMajorMode,
+    uint32_t          BLOCK_MN_FP4,     // 逻辑 M/N 维度（以 FP4 元素计）
+    uint32_t          BLOCK_K_FP4,      // 逻辑 K 维度（以 FP4 元素计）
+    uint32_t          kSwizzleMode      // 仍然是字节宽度：16/32/64/128
+>
+__device__ __forceinline__
+cute::UMMA::SmemDescriptor make_umma_desc_fp4(
+    cutlass::float_e2m1_t* base_smem_ptr_fp4,  // 逻辑 FP4 指针
+    uint32_t               mn_idx_fp4,         // 逻辑 M/N 索引（FP4 元素）
+    uint32_t               k_idx_fp4          // 逻辑 K 索引（FP4 元素）
+) {
+    // 底层物理布局仍然是 packed uint32_t：1 个 uint32_t = 8 个 FP4
+    constexpr uint32_t FP4_ELEMS_PER_INT32 = 8;
+    static_assert(BLOCK_K_FP4 % FP4_ELEMS_PER_INT32 == 0,
+                  "BLOCK_K_FP4 must be a multiple of 8 FP4 per uint32_t");
 
+    using phys_t = uint32_t;
+
+    // 物理 K 维（以 uint32_t 元素计）
+    constexpr uint32_t BLOCK_K_INT32 = BLOCK_K_FP4 / FP4_ELEMS_PER_INT32;
+
+    // FP4 逻辑指针 → 物理 uint32_t 指针
+    phys_t* base_smem_ptr_u32 = reinterpret_cast<phys_t*>(base_smem_ptr_fp4);
+
+    // 逻辑 k 索引（FP4） → 物理 k 索引（uint32_t）
+    const uint32_t k_idx_int32 = k_idx_fp4 / FP4_ELEMS_PER_INT32;
+
+    if constexpr (kMajorMode == cute::UMMA::Major::K) {
+        //
+        // K-major 情形：直接在这里手写一份 K-major 的 descriptor 构造，
+        // 语义与原来的 make_umma_desc<K,...,uint32_t> 保持一致，
+        // 但 BLOCK_K 用的是 BLOCK_K_INT32，避免你那条 static_assert 冲突。
+        //
+        DG_STATIC_ASSERT(
+            kSwizzleMode == BLOCK_K_INT32 * sizeof(phys_t),
+            "Unexpected value in FP4 K-major descriptor"
+        );
+
+        // K-major 下 atom: 8 × kSwizzleMode bytes 沿 K 方向，
+        // SBO/LBO 语义与原注释一致。
+        constexpr uint32_t stride_k = 1;
+        const uint32_t stride_byte_offset   = 8 * BLOCK_K_INT32 * sizeof(phys_t);
+        const uint32_t leading_byte_offset  = 0;
+
+        return make_smem_desc(
+            to_umma_layout_type<kSwizzleMode>(),
+            base_smem_ptr_u32 + mn_idx_fp4 * BLOCK_K_INT32 + k_idx_int32 * stride_k,
+            stride_byte_offset,
+            leading_byte_offset
+        );
+    } else {
+        //
+        // 非 K-major（MN-major）直接复用你已有的 uint32_t 版本，
+        // 只是在这里做一次 FP4→uint32_t 的坐标换算。
+        //
+        return make_umma_desc<
+            kMajorMode,
+            BLOCK_MN_FP4,        // M/N 维度不变
+            BLOCK_K_INT32,       // 物理 K 维（以 uint32_t 计）
+            kSwizzleMode,
+            phys_t
+        >(
+            base_smem_ptr_u32,
+            mn_idx_fp4,          // M/N 维度下标不变
+            k_idx_int32          // K 维下标按 uint32_t 对齐
+        );
+    }
+}
 __device__  __forceinline__
 uint64_t make_runtime_instr_desc_with_sf_id(cute::UMMA::InstrDescriptorBlockScaled desc, const uint32_t& sf_id) {
     desc.a_sf_id_ = sf_id, desc.b_sf_id_ = sf_id;

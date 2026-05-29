@@ -4,6 +4,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_fp8_gemm_1d2d.hpp"
+#include "../jit_kernels/impls/sm100_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 
 #include "layout.hpp"
@@ -32,10 +33,16 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     const auto& [m , k ] = get_shape<2>(a.first);
     const auto& [n , k_] = get_shape<2>(b.first);
     const auto& [m_, n_] = get_shape<2>(d);
-    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    const bool is_fp4_packed = (a.first.scalar_type() == torch::kInt);
+    if (is_fp4_packed) {
+        // FP4 packed: k is int32 count, D's K dim differs (output is [M,N])
+        DG_HOST_ASSERT(m == m_ and n == n_);
+    } else {
+        DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+        DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+    }
     DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
     // Check C as well
@@ -57,7 +64,9 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
     // Dispatch into different implements
     const auto& arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+    if (is_fp4_packed and arch_major == 10) {
+        sm100_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
@@ -122,11 +131,17 @@ static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     const auto& [num_groups, n, k_] = get_shape<3>(b.first);
     const auto& [m_, n_] = get_shape<2>(d);
     const auto& m__ = static_cast<int>(m_indices.numel());
+    const bool is_fp4_packed = (a.first.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    if (is_fp4_packed) {
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+    } else {
+        DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    }
     DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt);
 
     // D must be N-major
@@ -144,7 +159,10 @@ static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+    if (is_fp4_packed and arch_major == 10) {
+        sm100_m_grouped_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, m_indices,
+                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
+    } else if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, m_indices,
                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
@@ -188,12 +206,18 @@ static void m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::T
     const auto& [num_groups_, n, k_] = get_shape<3>(b.first);
     const auto& [num_groups__, m_, n_] = get_shape<3>(d);
     const auto& num_groups___ = static_cast<int>(masked_m.numel());
+    const bool is_fp4_packed = (a.first.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    if (is_fp4_packed) {
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+    } else {
+        DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    }
     DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
 
     // D must be N-major
@@ -207,7 +231,10 @@ static void m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::T
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+    if (is_fp4_packed and arch_major == 10) {
+        sm100_m_grouped_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
+                                             num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+    } else if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {

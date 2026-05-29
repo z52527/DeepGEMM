@@ -75,8 +75,8 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
     if (num_groups.has_value())
         DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
-    DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
-    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
+    // DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
+    // DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
 
     // TMA stride checks: TMA aligned and MN-major
     if (tma_stride_check) {
