@@ -48,6 +48,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -61,6 +62,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms,
+        args.gemm_config.swap_ab,
         to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype));
     }
 
@@ -212,10 +214,17 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
         k_work = aligned_k;
     }
 
+    // Use ACTUAL useful row count (m_indices >= 0) instead of padded m / num_groups,
+    // since for sparse MoE (G=256, few tokens routed) padded per-group always = BLOCK_M
+    // even when most rows are -1 padding. One small GPU reduction + sync per launch
+    // (acceptable cost vs the 25% perf win it unlocks on the wave-plateau region).
+    const auto useful_m = (m_indices >= 0).sum().item<int64_t>();
+    const int useful_per_group = num_groups > 0 ? static_cast<int>(useful_m) / num_groups : 0;
     const auto& config = get_best_fp4_config(GemmType::MGroupedContiguous,
                                              m, n, k, 1, major_a, major_b,
                                              d.scalar_type(), false,
-                                             device_runtime->get_num_sms());
+                                             device_runtime->get_num_sms(),
+                                             /*expected_m_per_group=*/useful_per_group);
 
     // Create tensor descriptors. B carries num_groups in the outer dim;
     // A is 2D since the M-dim is already concatenated across groups (m_indices selects the group per row).
@@ -229,8 +238,11 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
                                                config.block_k,
                                                static_cast<int>(b_work.stride(get_non_contiguous_dim(major_b))), num_groups,
                                                config.smem_config.swizzle_b_mode);
+    // Swap-AB epilogue uses STORE_BLOCK_M=16 (skip padding rows). TMA descriptor
+    // outer dim (M direction) must match: use 16 instead of full block_m.
+    const int store_block_m_for_tma = config.swap_ab ? 16 : SM100ArchSpec::get_cd_store_block_m(config.block_m);
     const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
-                                                SM100ArchSpec::get_cd_store_block_m(config.block_m),
+                                                store_block_m_for_tma,
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.smem_config.swizzle_cd_mode);

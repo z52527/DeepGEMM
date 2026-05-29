@@ -60,6 +60,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
+          bool kSwapAB,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
@@ -127,15 +128,26 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     // ========== 块大小计算 ==========
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
-    constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
-    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
-    
+    // Swap-AB epilogue: STORE_BLOCK_M = 16 (fine-grained M slices to skip padding rows),
+    //                   STORE_BLOCK_N = BLOCK_N (write entire N at once).
+    // Non-swap (existing): STORE_BLOCK_M = BLOCK_M, STORE_BLOCK_N derived from swizzle.
+    constexpr uint32_t STORE_BLOCK_M = kSwapAB ? 16u : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
+    constexpr uint32_t STORE_BLOCK_N = kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
+
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "FP4 only supports B-multicast (2CTA along M)");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M and BLOCK_M % LAYOUT_AD_M == 0, "Only support tensor memory layout A/D");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
+    // Swap-AB requires BLOCK_N = LAYOUT_AD_M (= 128) so UMMA_M after swap stays = 128.
+    DG_STATIC_ASSERT(not kSwapAB or BLOCK_N == LAYOUT_AD_M, "kSwapAB requires BLOCK_N = LAYOUT_AD_M");
+    // Swap-AB initial implementation: no multicast (cluster_n=1, cluster_m=1) for simplicity.
+    DG_STATIC_ASSERT(not kSwapAB or kNumMulticast == 1, "kSwapAB initial impl: no multicast");
 
     // ========== 共享内存大小计算 ==========
-    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * kSwizzleCDMode;
+    // Swap-AB: per-stage SMEM = STORE_BLOCK_M (small) × STORE_BLOCK_N (= BLOCK_N) × sizeof(D)
+    // Non-swap: per-stage SMEM = STORE_BLOCK_M × kSwizzleCDMode (= STORE_BLOCK_N * sizeof(D))
+    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = kSwapAB
+        ? STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t)
+        : STORE_BLOCK_M * kSwizzleCDMode;
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(uint32_t);
     constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(uint32_t);
@@ -333,22 +345,38 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     } else if (warp_idx == 1 and is_leader_cta) {
         // ========== Warp 1: UTCCP SF copy + MMA ==========
         constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
-        constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
+        // Swap-AB: UMMA_N becomes BLOCK_M (the original M dim now plays N role in MMA).
+        constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
         constexpr uint32_t UMMA_K_INT32 = UMMA_K_FP4 / FP4_ELEMS_PER_INT32;
         constexpr uint32_t NUM_K_ITERS_PER_STAGE = BLOCK_K / UMMA_K_INT32;
-        constexpr uint32_t NUM_N_ITERS = BLOCK_N / UMMA_N;
+        // After swap, the "N iters" walk over BLOCK_M (now the MMA-N axis); without swap, over BLOCK_N.
+        constexpr uint32_t NUM_N_ITERS = (kSwapAB ? BLOCK_M : BLOCK_N) / UMMA_N;
 
-        auto instr_desc_mxf4 = cute::UMMA::make_instr_desc_block_scaled<
-            cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
-            UMMA_M, UMMA_N, kMajorA, kMajorB>();
+        // Swap-AB: pass (b_dtype, a_dtype, ..., kMajorB, kMajorA) to MMA so B occupies MMA-A slot
+        //            and A occupies MMA-B slot. Output in TMEM is D^T (N rows, M cols).
+        auto instr_desc_mxf4 = kSwapAB
+            ? cute::UMMA::make_instr_desc_block_scaled<
+                cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
+                UMMA_M, UMMA_N, kMajorB, kMajorA>()
+            : cute::UMMA::make_instr_desc_block_scaled<
+                cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
+                UMMA_M, UMMA_N, kMajorA, kMajorB>();
 
-        using cute_mma_mxf4_t = cute::conditional_t<kNumMulticast == 1,
+        using cute_mma_mxf4_noswap_t = cute::conditional_t<kNumMulticast == 1,
             cute::SM100_MMA_MXF4_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
                                     cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
                                     kMajorA, kMajorB>,
             cute::SM100_MMA_MXF4_2x1SM_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
                                           cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
                                           kMajorA, kMajorB>>;
+        using cute_mma_mxf4_swap_t = cute::conditional_t<kNumMulticast == 1,
+            cute::SM100_MMA_MXF4_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
+                                    cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
+                                    kMajorB, kMajorA>,
+            cute::SM100_MMA_MXF4_2x1SM_SS<cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
+                                          cutlass::float_ue8m0_t, UMMA_M, UMMA_N, MXF4_VS,
+                                          kMajorB, kMajorA>>;
+        using cute_mma_mxf4_t = cute::conditional_t<kSwapAB, cute_mma_mxf4_swap_t, cute_mma_mxf4_noswap_t>;
 
         DG_STATIC_ASSERT(UMMA_M == 128 or UMMA_M == 256, "MXF4 supports M=128 (1CTA) or M=256 (2CTA)");
         DG_STATIC_ASSERT((UMMA_N % 8 == 0) and (8 <= UMMA_N) and (UMMA_N <= 256), "Invalid MXF4 N-mode size");
@@ -450,11 +478,21 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                                         a_desc_stage_lo, w * LAYOUT_AD_M * BLOCK_K, k * UMMA_K_INT32);
 
                                     uint32_t tmem_col = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + n * UMMA_N;
-                                    cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col,
-                                                         k_iter > 0 or s > 0 or k > 0,
-                                                         runtime_desc_k,
-                                                         tmem_sfa_base + w * (kNumUTCCPAlignedElems / 32),
-                                                         tmem_sfb_k);
+                                    if constexpr (kSwapAB) {
+                                        // Swap-AB: B goes into MMA-A slot, A into MMA-B slot.
+                                        // SF column args also swap (SFB first, SFA second).
+                                        cute_mma_mxf4_t::fma(b_desc, a_desc, tmem_col,
+                                                             k_iter > 0 or s > 0 or k > 0,
+                                                             runtime_desc_k,
+                                                             tmem_sfb_k,
+                                                             tmem_sfa_base + w * (kNumUTCCPAlignedElems / 32));
+                                    } else {
+                                        cute_mma_mxf4_t::fma(a_desc, b_desc, tmem_col,
+                                                             k_iter > 0 or s > 0 or k > 0,
+                                                             runtime_desc_k,
+                                                             tmem_sfa_base + w * (kNumUTCCPAlignedElems / 32),
+                                                             tmem_sfb_k);
+                                    }
                                 }
                             }
                         }
@@ -549,6 +587,116 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         constexpr uint32_t kNumBankGroupBytes = 16;
         constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
 
+      if constexpr (kSwapAB) {
+        // =================================================================
+        // Swap-AB epilogue:
+        //   TMEM holds D^T (BLOCK_N rows × BLOCK_M cols).
+        //   Per accum stage covers cols [accum_stage_idx*BLOCK_M, +BLOCK_M) of TMEM.
+        //   STORE_BLOCK_M=16: each `s` iter covers 16 cols of TMEM (= 16 of D's M).
+        //   num_stores = effective_m / 16 → padding cols are skipped entirely.
+        //   STORE_BLOCK_N = BLOCK_N: each TMA store covers entire BLOCK_N at once.
+        // =================================================================
+        constexpr uint32_t kNumSwizzleAtomRows = 8;
+        constexpr uint32_t STORE_BLOCK_N_ATOM = kSwizzleCDMode / sizeof(cd_dtype_t);
+        constexpr uint32_t kNumWarpsPerAtom = STORE_BLOCK_N_ATOM / 32;
+        DG_STATIC_ASSERT(STORE_BLOCK_M % kNumSwizzleAtomRows == 0, "Invalid swap-AB store_block_m");
+        DG_STATIC_ASSERT(STORE_BLOCK_N % STORE_BLOCK_N_ATOM == 0, "Invalid swap-AB store_block_n");
+        DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Swap-AB requires full warpgroup");
+
+        uint32_t tma_stage_idx = 0;
+        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
+                auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
+
+                tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+                tcgen05_after_thread_sync();
+
+                // Effective M (aligned up to STORE_BLOCK_M=16): how many M-cols of D^T are valid.
+                const auto effective_m = scheduler.template get_aligned_effective_m_in_block<STORE_BLOCK_M>(m_block_idx);
+                const uint32_t num_stores = effective_m / STORE_BLOCK_M;
+
+                // TMEM col where this accum stage's tile starts.
+                const auto tmem_base_addr = accum_stage_idx * BLOCK_M;
+                const auto base_m_idx = scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx);
+                const auto base_n_idx = n_block_idx * BLOCK_N;
+
+                #pragma unroll 1
+                for (uint32_t s = 0; s < num_stores; ++ s) {
+                    // Wait if TMA store pipeline full
+                    if (s >= kNumTMAStoreStages) {
+                        if (epilogue_thread_idx == 0)
+                            cute::tma_store_wait<kNumTMAStoreStages - 1>();
+                        cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
+                    }
+
+                    // SMEM store: 4 warps cooperatively write STORE_BLOCK_M × STORE_BLOCK_N tile.
+                    // Each warp owns STORE_BLOCK_M rows × STORE_BLOCK_N_ATOM cols.
+                    // Within each warp, loop covers STORE_BLOCK_M / kNumSwizzleAtomRows = 2 sub-blocks of 8 rows.
+                    #pragma unroll
+                    for (uint32_t i = 0; i < STORE_BLOCK_M / kNumSwizzleAtomRows; ++ i) {
+                        uint32_t tmem_addr = tmem_base_addr +
+                                             s * STORE_BLOCK_M +              // M-slice (cols of TMEM)
+                                             i * kNumSwizzleAtomRows;          // Sub-block within slice
+
+                        uint32_t outer_atom_offset = (epilogue_warp_idx / kNumWarpsPerAtom) * STORE_BLOCK_M * kSwizzleCDMode;
+                        uint32_t inner_atom_offset = i * kNumSwizzleAtomRows * kSwizzleCDMode;
+                        auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                             outer_atom_offset + inner_atom_offset;
+
+                        if constexpr (cute::is_same_v<cd_dtype_t, float>) {
+                            uint32_t values[kNumSwizzleAtomRows];
+                            // Load 32dp × 8 cols of TMEM per warp (= 8 M-cols × 32 N-rows of D).
+                            cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
+                                values[0], values[1], values[2], values[3],
+                                values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                            uint32_t col = lane_idx / 4;
+                            #pragma unroll
+                            for (uint32_t row = 0; row < kNumSwizzleAtomRows; ++ row) {
+                                auto smem_ptr = smem_base_ptr + row * (kNumBankGroupBytes * 8)
+                                                              + (col ^ row) * kNumBankGroupBytes
+                                                              + (lane_idx % 4) * sizeof(float);
+                                st_shared(reinterpret_cast<uint32_t*>(smem_ptr), values[row]);
+                            }
+                        }
+                    }
+
+                    // Notify TMEM empty on last store
+                    if (s == num_stores - 1) {
+                        tcgen05_before_thread_sync();
+                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                    }
+                    __syncwarp();
+
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
+
+                    if (epilogue_thread_idx == 0) {
+                        uint32_t m_idx = base_m_idx + s * STORE_BLOCK_M;
+                        #pragma unroll
+                        for (uint32_t ai = 0; ai < STORE_BLOCK_N / STORE_BLOCK_N_ATOM; ++ ai) {
+                            auto smem_ptr = smem_cd[tma_stage_idx] + ai * STORE_BLOCK_M * STORE_BLOCK_N_ATOM;
+                            uint32_t n_idx = base_n_idx + ai * STORE_BLOCK_N_ATOM;
+                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                                cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                            cute_tma_t::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
+                        }
+                        cute::tma_store_arrive();
+                    }
+
+                    tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
+                }
+
+                // If entire tile is padding (effective_m=0, hence num_stores=0): still arrive at empty barrier
+                // so MMA pipeline can advance.
+                if (num_stores == 0) {
+                    tcgen05_before_thread_sync();
+                    tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                }
+            });
+        }
+      } else {
+        // ===== Existing non-swap epilogue (unchanged) =====
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
@@ -640,6 +788,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                 }
             });
         }
+      }  // end of if constexpr (kSwapAB) else (non-swap)
 
         if (epilogue_thread_idx == 0)
             cute::tma_store_wait<0>();

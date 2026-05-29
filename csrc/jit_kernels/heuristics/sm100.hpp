@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
 #include <deep_gemm/common/types.hpp>
@@ -167,11 +169,16 @@ struct SM100ArchSpec {
 // BLOCK_N to reduce wasted computation, since FP4's high arithmetic
 // intensity means we're less sensitive to launch overhead.
 
+// `expected_m_per_group`: typical valid-row count per BLOCK_M tile. Only consulted for
+//   m-grouped types to decide whether swap_ab's effective-M epilogue would pay off
+//   (small per-group M → lots of padding → swap_ab wins; large per-group M → padding
+//   ≈0 → swap_ab's 8× small-store overhead wins). Default `INT_MAX` keeps swap_ab off.
 static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
                                       const int& m, const int& n, const int& k, const int& num_groups,
                                       const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                       const at::ScalarType& cd_dtype,
-                                      const bool& with_accumulation, const int& num_sms) {
+                                      const bool& with_accumulation, const int& num_sms,
+                                      const int& expected_m_per_group = std::numeric_limits<int>::max()) {
     constexpr auto ab_dtype = at::kInt;  // FP4 packed as int32
     constexpr auto kernel_type = KernelType::Kernel1D1D;
     constexpr int block_m = 128;   // MXF4 UMMA_M is always 128
@@ -286,6 +293,18 @@ static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
         multicast_config = {2, false};  // B-multicast
     }
 
+    // Swap-AB for m-grouped FP4: only beneficial when per-group M is small enough that
+    // many BLOCK_M tiles have padding (effective_m < BLOCK_M). When per-group M >= BLOCK_M
+    // (= 128), each tile is fully utilized → swap_ab's 8× small-store overhead is pure
+    // loss. Gate on expected_m_per_group < BLOCK_M.
+    bool swap_ab = false;
+    if ((gemm_type == GemmType::MGroupedContiguous || gemm_type == GemmType::MGroupedMasked)
+        && expected_m_per_group < block_m) {
+        swap_ab = true;
+        best_block_n = 128;          // Kernel static_assert: kSwapAB requires BLOCK_N = LAYOUT_AD_M
+        multicast_config = {1, false};  // v0: disable multicast under swap_ab
+    }
+
     // Find max pipeline stages that fit in shared memory
     constexpr int smem_capacity = SM100ArchSpec::smem_capacity;
     int best_num_stages = 0;
@@ -319,6 +338,7 @@ static GemmConfig get_best_fp4_config(const GemmType& gemm_type,
         .num_last_stages = ceil_div(k, block_k) % best_num_stages,
         .num_sms = num_sms,
         .tc_util = device_runtime->get_tc_util(),
+        .swap_ab = swap_ab,
         .multicast_config = multicast_config,
         .smem_config = best_smem_config,
         .thread_config = SM100ArchSpec::get_thread_config(kernel_type, block_m, best_block_n)

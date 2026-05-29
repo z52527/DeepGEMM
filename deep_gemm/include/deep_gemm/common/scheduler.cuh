@@ -222,6 +222,38 @@ struct Scheduler {
             return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + current_group_idx);
         }
     }
+
+    // Effective M (valid, non-padding rows) within the BLOCK_M tile at `m_block_idx`,
+    // aligned up to `kAlign` (typically the STORE_BLOCK_M used by swap-AB epilogue).
+    //
+    // For MGroupedContiguous: rows with m_indices != -1 (padding rows are -1 at the
+    //   tail of each group's row range, by construction in tests/generators).
+    // For MGroupedMasked: min(BLOCK_M, masked_m[current_group_idx] - rows already
+    //   covered by previous BLOCK_M tiles in this group).
+    // For Normal / KGroupedContiguous: BLOCK_M (no padding).
+    template <uint32_t kAlign = 16>
+    __device__ __forceinline__ uint32_t get_aligned_effective_m_in_block(const uint32_t& m_block_idx) const {
+        uint32_t effective = BLOCK_M;
+        if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+            // Linear scan of m_indices in this tile; padding (-1) sits at the tail
+            // of each group's row range so the first -1 marks the boundary.
+            const auto base = m_block_idx * BLOCK_M;
+            #pragma unroll
+            for (uint32_t i = 0; i < BLOCK_M; ++i) {
+                if (__ldg(grouped_layout + base + i) < 0) {
+                    effective = i;
+                    break;
+                }
+            }
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
+            const auto masked_m_g = static_cast<uint32_t>(__ldg(grouped_layout + current_group_idx));
+            const auto m_in_group_so_far = (m_block_idx - current_m_cumsum) * BLOCK_M;
+            effective = (m_in_group_so_far >= masked_m_g) ? 0u
+                                                          : min(BLOCK_M, masked_m_g - m_in_group_so_far);
+        }
+        // else Normal / KGroupedContiguous: full BLOCK_M
+        return ceil_div(effective, kAlign) * kAlign;
+    }
 };
 
 #pragma clang diagnostic pop

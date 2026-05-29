@@ -67,6 +67,12 @@ struct GemmConfig {
     int num_sms;
     int tc_util;
 
+    // Swap-AB flag: when true, kernel computes D^T = B @ A^T (swapping operand roles
+    // at MMA level + transposed epilogue). Enables A-multicast / effective-M skipping
+    // for m-grouped GEMMs where M-tiles can belong to different groups.
+    // See tests/swap_ab_porting_guide.md for context.
+    bool swap_ab = false;
+
     // Structured configs
     MulticastConfig multicast_config;
     SharedMemoryConfig smem_config;
