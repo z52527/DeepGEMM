@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdlib>
+#include <string>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <deep_gemm/common/types.cuh>
 
@@ -15,6 +18,53 @@ struct SM120ArchSpec {
 
     static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16), both FP8 and BF16 with kNWarps=2
 
+    static bool is_forced_qkv_3k_tile(const GemmDesc& desc) {
+        return desc.gemm_type == GemmType::Normal and
+            desc.kernel_type == KernelType::Kernel1D1D and
+            desc.get_mma_kind() == MmaKind::MXFP8FP4 and
+            desc.a_dtype == torch::kFloat8_e4m3fn and
+            desc.b_dtype == torch::kFloat8_e4m3fn and
+            desc.get_expected_m() == 3072 and
+            desc.get_expected_n() == 3072 and
+            desc.get_expected_k() == 2048;
+    }
+
+    static Layout get_forced_qkv_3k_tile_layout() {
+        const char* tile_cstr = std::getenv("DG_FORCE_QKV_TILE");
+        if (tile_cstr == nullptr)
+            return Layout{0, 192, 96, 64, 1, 1};
+
+        const std::string tile(tile_cstr);
+        if (tile.empty() or tile == "192x96" or tile == "192x96x64")
+            return Layout{0, 192, 96, 64, 1, 1};
+        if (tile == "192x96x128")
+            return Layout{0, 192, 96, 128, 1, 1};
+        if (tile == "128x128")
+            return Layout{0, 128, 128, 64, 1, 1};
+
+        DG_HOST_ASSERT(false and "DG_FORCE_QKV_TILE must be one of: 192x96, 192x96x128, 128x128");
+        return Layout{0, 192, 96, 64, 1, 1};
+    }
+
+    static int get_forced_qkv_3k_epi_sub_m() {
+        const char* epi_cstr = std::getenv("DG_FORCE_QKV_EPI_SUB_M");
+        if (epi_cstr == nullptr)
+            return 0;
+
+        const std::string epi(epi_cstr);
+        if (epi.empty())
+            return 0;
+        if (epi == "48")
+            return 48;
+        if (epi == "64")
+            return 64;
+        if (epi == "96")
+            return 96;
+
+        DG_HOST_ASSERT(false and "DG_FORCE_QKV_EPI_SUB_M must be one of: 48, 64, 96");
+        return 0;
+    }
+
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
@@ -23,6 +73,27 @@ struct SM120ArchSpec {
         // BLOCK_M candidates: {64, 128} valid for both FP8 and BF16 (kNWarps=2, kMWarps=4).
         const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+        if (is_forced_qkv_3k_tile(desc))
+            return {get_forced_qkv_3k_tile_layout()};
+
+        // EXPERIMENT HOOK (env-gated, DEFAULT OFF -> zero effect on production dispatch):
+        // DG_FORCE_TILE=BMxBNxBK forces a single tile for ANY shape (general analogue of the
+        // qkv-only DG_FORCE_QKV_TILE), used to sweep tile/wave-quantization tradeoffs.
+        {
+            const char* ft = std::getenv("DG_FORCE_TILE");
+            if (ft != nullptr and std::string(ft) != "") {
+                const std::string s(ft);
+                const auto x1 = s.find('x');
+                const auto x2 = (x1 == std::string::npos) ? std::string::npos : s.find('x', x1 + 1);
+                DG_HOST_ASSERT(x1 != std::string::npos and x2 != std::string::npos
+                               and "DG_FORCE_TILE must be BMxBNxBK, e.g. 64x64x64");
+                const int bm = std::stoi(s.substr(0, x1));
+                const int bn = std::stoi(s.substr(x1 + 1, x2 - x1 - 1));
+                const int bk = std::stoi(s.substr(x2 + 1));
+                DG_HOST_ASSERT(bm > 0 and bn > 0 and bk > 0 and "DG_FORCE_TILE dims must be positive");
+                return {Layout{0, bm, bn, bk, 1, 1}};
+            }
+        }
 
         std::vector<int> block_m_candidates;
         if (runtime_align <= kMinBlockM)
@@ -144,8 +215,13 @@ struct SM120ArchSpec {
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
         const int cd_size = c10::elementSize(desc.cd_dtype);
+        const int cd_tile_bytes = layout.block_n * cd_size;
         // cd_n_contiguous gates the TMA-store epilogue (off for AB-swap transposed output).
-        const auto swizzle_mode_cd = (desc.cd_n_contiguous and layout.block_n * cd_size >= 128) ? 128 : 0;
+        // Prefer 128B swizzle, but use 64B for tiles like BN=96 bf16 where the row is
+        // 192B: 192 % 128 disables the TMA-store path, while 192 % 64 keeps it valid.
+        const auto swizzle_mode_cd = !desc.cd_n_contiguous ? 0 :
+            (cd_tile_bytes >= 128 and cd_tile_bytes % 128 == 0) ? 128 :
+            (cd_tile_bytes >= 64 and cd_tile_bytes % 64 == 0) ? 64 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
@@ -163,6 +239,13 @@ struct SM120ArchSpec {
             const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
             if (stages_sub > stages_full)
                 store_m = kSubTileM;
+        }
+        const int forced_epi_sub_m = get_forced_qkv_3k_epi_sub_m();
+        if (forced_epi_sub_m > 0) {
+            DG_HOST_ASSERT(is_forced_qkv_3k_tile(desc) and layout.block_m == 192 and layout.block_n == 96 and
+                           swizzle_mode_cd == 64 and layout.block_m % forced_epi_sub_m == 0 and
+                           "DG_FORCE_QKV_EPI_SUB_M is only supported for forced 192x96 QKV tiles");
+            store_m = forced_epi_sub_m;
         }
 
         return {
@@ -203,9 +286,26 @@ struct SM120ArchSpec {
 
         const int smem_extra = smem_barriers + smem_tensormap + smem_d;
         const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
-        const int num_stages = std::min(
+        int num_stages = std::min(
             (smem_capacity - smem_extra) / smem_per_stage,
             kNumMaxStages);
+        if (is_forced_qkv_3k_tile(desc) and
+            layout.block_m == 192 and layout.block_n == 96 and layout.block_k == 64 and
+            storage_config.swizzle_cd_mode == 64 and
+            (storage_config.store_block_m == 48 or storage_config.store_block_m == 64 or
+             storage_config.store_block_m == 96)) {
+            DG_HOST_ASSERT(4 <= num_stages and
+                           "Forced 192x96x64 stage4 tile exceeds shared memory capacity");
+            num_stages = 4;
+        }
+        if (is_forced_qkv_3k_tile(desc) and
+            layout.block_m == 192 and layout.block_n == 96 and layout.block_k == 128 and
+            storage_config.swizzle_cd_mode == 64 and
+            (storage_config.store_block_m == 64 or storage_config.store_block_m == 96)) {
+            DG_HOST_ASSERT(2 <= num_stages and
+                           "Forced 192x96x128 stage2 tile exceeds shared memory capacity");
+            num_stages = 2;
+        }
         return {
             smem_extra + num_stages * smem_per_stage,
             num_stages
@@ -303,6 +403,27 @@ struct SM120ArchSpec {
         const int num_n_blocks = ceil_div(desc.get_expected_n(), layout.block_n);
         const int num_mn_blocks = num_m_blocks * num_n_blocks;
         const int num_k_blocks = ceil_div(static_cast<int>(desc.get_expected_k()), layout.block_k);
+
+        // EXPERIMENT HOOK (env-gated, DEFAULT OFF -> zero effect on production dispatch):
+        // DG_FORCE_SPLIT_K=<n> forces split-K for shapes the heuristic would leave at 1,
+        // still clamped to SF-tile K alignment + workspace so partial-sum results stay correct.
+        {
+            const char* force_sk = std::getenv("DG_FORCE_SPLIT_K");
+            if (force_sk != nullptr and std::string(force_sk) != "" and std::atoi(force_sk) > 1) {
+                const int sf_tile_kb = (4 * desc.max_gran_k) / layout.block_k;
+                if (sf_tile_kb == 0)
+                    return 1;
+                int fk = std::atoi(force_sk);
+                while (fk > 1 and (num_k_blocks % fk != 0 or (num_k_blocks / fk) % sf_tile_kb != 0))
+                    --fk;
+                fk = std::min(fk, num_k_blocks / (2 * sf_tile_kb));
+                constexpr int64_t kMaxWsBytes = 32 * 1024 * 1024;
+                const int64_t mn_b = static_cast<int64_t>(desc.get_expected_m()) * desc.get_expected_n() * sizeof(float);
+                if (mn_b > 0)
+                    fk = std::min(fk, std::max(static_cast<int>(kMaxWsBytes / mn_b), 1));
+                return std::max(fk, 1);
+            }
+        }
 
         if (num_mn_blocks >= desc.num_sms / 2)
             return 1;

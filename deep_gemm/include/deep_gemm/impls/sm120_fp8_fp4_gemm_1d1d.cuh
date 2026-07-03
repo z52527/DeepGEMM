@@ -44,6 +44,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
+          uint32_t kAblationMode = 0,
           uint32_t kSplitKFactor = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
@@ -98,6 +99,29 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;
 
+    static constexpr uint32_t kAblationNoTMAStore = 1u << 0;
+    static constexpr uint32_t kAblationNoEpilogueStore = 1u << 1;
+    static constexpr uint32_t kAblationNoMMA = 1u << 2;
+    static constexpr uint32_t kAblationNoSFLoad = 1u << 3;
+    static constexpr uint32_t kAblationNoABTMALoad = 1u << 4;
+    static constexpr uint32_t kAblationNoFragmentLoad = 1u << 5;
+    static constexpr uint32_t kAblationNoSFTMALoad = 1u << 6;
+    static constexpr uint32_t kAblationNoKPipeline = 1u << 7;
+    static constexpr uint32_t kAblationValidMask = kAblationNoTMAStore |
+        kAblationNoEpilogueStore | kAblationNoMMA | kAblationNoSFLoad |
+        kAblationNoABTMALoad | kAblationNoFragmentLoad |
+        kAblationNoSFTMALoad | kAblationNoKPipeline;
+    static constexpr bool kAblationSkipTMAStore = (kAblationMode & kAblationNoTMAStore) != 0;
+    static constexpr bool kAblationSkipEpilogueStore = (kAblationMode & kAblationNoEpilogueStore) != 0;
+    static constexpr bool kAblationSkipMMA = (kAblationMode & kAblationNoMMA) != 0;
+    static constexpr bool kAblationSkipABTMALoad = (kAblationMode & kAblationNoABTMALoad) != 0;
+    static constexpr bool kAblationSkipFragmentLoad = (kAblationMode & kAblationNoFragmentLoad) != 0;
+    static constexpr bool kAblationSkipSFTMALoad = (kAblationMode & kAblationNoSFTMALoad) != 0;
+    static constexpr bool kAblationSkipKPipeline = (kAblationMode & kAblationNoKPipeline) != 0;
+    static constexpr bool kAblationSkipSFLoad = ((kAblationMode & kAblationNoSFLoad) != 0) or
+        kAblationSkipSFTMALoad or kAblationSkipKPipeline;
+    static_assert((kAblationMode & ~kAblationValidMask) == 0, "Invalid SM120 FP8/FP4 ablation mode");
+
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = kSwizzleCDMode > 0
         and BLOCK_N * sizeof(cd_dtype_t) >= kSwizzleCDMode
@@ -128,6 +152,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // kAIsFP4: A is fp4 packed in GMEM (.b4x16 expands to unpacked SMEM), so GMEM = SMEM_A/2.
     static constexpr uint32_t TMA_A_BYTES = kAIsFP4 ? (SMEM_A / 2) : SMEM_A;
     static constexpr uint32_t SMEM_TMA_BYTES = TMA_A_BYTES + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
+    static constexpr uint32_t SMEM_TMA_AB_BYTES_ABLATED = kAblationSkipABTMALoad ? 0u : (TMA_A_BYTES + TMA_B_BYTES);
+    static constexpr uint32_t SMEM_TMA_SF_BYTES_ABLATED = kAblationSkipSFTMALoad ? 0u : (TMA_SFA_BYTES + TMA_SFB_BYTES);
+    static constexpr uint32_t SMEM_TMA_BYTES_ABLATED = SMEM_TMA_AB_BYTES_ABLATED + SMEM_TMA_SF_BYTES_ABLATED;
     // ldmatrix K stride in bytes: FP4 packed = MMA_K/2, FP8 = MMA_K. Both = 32 bytes.
     static constexpr uint32_t kLdmK = kIsFP4 ? (MMA_K / 2) : MMA_K;
     // tma::copy swizzle for split computation: FP4 packed with B64 has 64 byte rows = full BLOCK_K,
@@ -299,6 +326,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
 
+                if constexpr (not kAblationSkipKPipeline) {
                 for (uint32_t kb = kb_start; kb < kb_end; ++kb) {
                     CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
                     empty_barriers[s]->wait(p ^ 1);
@@ -318,17 +346,25 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
                             shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                    tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                    tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                    if constexpr (kBKMajor) {
-                        tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
-                    } else {
-                        tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                            tma_b_desc, full_barriers[s], smem_b[s],
-                            n_idx, k_idx, 1, batch_idx);
+                    if constexpr (not kAblationSkipSFTMALoad) {
+                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                        tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
                     }
-                    full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
+                    if constexpr (not kAblationSkipABTMALoad) {
+                        tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                        if constexpr (kBKMajor) {
+                            tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                        } else {
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                                tma_b_desc, full_barriers[s], smem_b[s],
+                                n_idx, k_idx, 1, batch_idx);
+                        }
+                    }
+                    if constexpr (SMEM_TMA_BYTES_ABLATED > 0)
+                        full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES_ABLATED);
+                    else
+                        full_barriers[s]->arrive();
+                }
                 }
             }
         }
@@ -379,6 +415,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 "SF-major loop requires matching A/B SF tile sizes");
             static constexpr uint32_t kSFTileKBlocks = kUseSFMajorLoop ? kNumSFAStagesPerLoad : 1;
 
+            if constexpr (not kAblationSkipKPipeline) {
             if constexpr (kUseSFMajorLoop) {
             // SF-MAJOR PATH: gran_k >= BLOCK_K
             // Load SF packed int32 into registers once per kSFTileKBlocks K-blocks,
@@ -417,6 +454,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     sf_t sfb_hoisted[kNTilesPerWarp];
                     sf_t sfa_hoisted[kMTilesPerWarp];
 
+                    if constexpr (kAblationSkipSFLoad) {
+                        #pragma unroll
+                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                            sfb_hoisted[nt] = sf_t(0);
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                            sfa_hoisted[mt] = sf_t(0);
+                    } else {
                     if (kb_inner == 0) {
                         #pragma unroll
                         for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
@@ -451,30 +496,49 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             sfa_hoisted[mt] = sm120_mma::extract_sf_byte(sf_packed_a[mt], sf_byte_a);
                         }
                     }
+                    }
 
                     static constexpr uint32_t kKStepPairs = kKSteps / 2;
                     #pragma unroll
                     for (uint32_t kp = 0; kp < kKStepPairs; ++kp) {
                         const uint32_t ks_base = kp * 2;
 
-                        #pragma unroll
-                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
-                            sm120::load_a_fragment(a_frag[0][mt], smem_a[stage], a_ctx[mt], lane_idx, ks_base, kLdmK);
+                        if constexpr (kAblationSkipFragmentLoad) {
+                            #pragma unroll
+                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i) {
+                                    a_frag[0][mt][i] = 0;
+                                    a_frag[1][mt][i] = 0;
+                                }
+                            }
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i)
+                                    b_nt[nt][i] = 0;
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                sm120::load_a_fragment(a_frag[0][mt], smem_a[stage], a_ctx[mt], lane_idx, ks_base, kLdmK);
 
-                        #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
-                            sm120::load_b_per_ntile_x4(b_nt[nt], smem_b[stage], b_ctx[nt], lane_idx, kp, kLdmK * 2);
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                sm120::load_b_per_ntile_x4(b_nt[nt], smem_b[stage], b_ctx[nt], lane_idx, kp, kLdmK * 2);
 
-                        #pragma unroll
-                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
-                            sm120::load_a_fragment(a_frag[1][mt], smem_a[stage], a_ctx[mt], lane_idx, ks_base + 1, kLdmK);
+                            #pragma unroll
+                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                sm120::load_a_fragment(a_frag[1][mt], smem_a[stage], a_ctx[mt], lane_idx, ks_base + 1, kLdmK);
+                        }
 
                         #pragma unroll
                         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
-                                if constexpr (kIsFP4)
+                                if constexpr (kAblationSkipMMA) {
+                                } else if constexpr (kIsFP4)
                                     sm120_mma::fp4_mma_block_scaled(d, a_frag[0][mt], b_nt[nt][0], b_nt[nt][1], sfa_hoisted[mt], sfb_hoisted[nt]);
                                 else
                                     sm120_mma::fp8_mma_block_scaled(d, a_frag[0][mt], b_nt[nt][0], b_nt[nt][1], sfa_hoisted[mt], sfb_hoisted[nt]);
@@ -486,7 +550,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             #pragma unroll
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
-                                if constexpr (kIsFP4)
+                                if constexpr (kAblationSkipMMA) {
+                                } else if constexpr (kIsFP4)
                                     sm120_mma::fp4_mma_block_scaled(d, a_frag[1][mt], b_nt[nt][2], b_nt[nt][3], sfa_hoisted[mt], sfb_hoisted[nt]);
                                 else
                                     sm120_mma::fp8_mma_block_scaled(d, a_frag[1][mt], b_nt[nt][2], b_nt[nt][3], sfa_hoisted[mt], sfb_hoisted[nt]);
@@ -1143,9 +1208,18 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     empty_barriers[stage]->arrive();
             }
             } // else (!kUseSFMajorLoop) — original path
+            } // !kAblationSkipKPipeline
 
             // Epilogue
-            if constexpr (kSplitKFactor > 1) {
+            if constexpr (kAblationSkipEpilogueStore) {
+                if (lane_idx == 0) {
+                    float sink = 0.f;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAccumPerWarp; i += MMA_ACCUM)
+                        sink += accum[i];
+                    asm volatile("{ .reg .pred p; setp.nan.f32 p, %0, %0; @p nanosleep.u32 1; }" :: "f"(sink));
+                }
+            } else if constexpr (kSplitKFactor > 1) {
                 // Split-K: write FP32 partials to workspace
                 const uint32_t m_base_sk = m_block_idx * BLOCK_M;
                 const uint32_t n_base_sk = n_block_idx * BLOCK_N;
@@ -1257,27 +1331,29 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                     if (math_warp_idx == 0 and lane_idx == 0) {
                         const uint32_t batch_store_idx = kIsBatchedEpilogue ? scheduler.current_group_idx : 0;
-                        #pragma unroll
-                        for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
-                            auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * kEpiSubM;
-                            const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
-                                n_base + ts * kTMAStoreInnerDim);
-                            if constexpr (kIsBatchedEpilogue) {
-                                if constexpr (kWithAccumulation)
-                                    cute::SM90_TMA_REDUCE_ADD_3D::copy(
+                        if constexpr (not kAblationSkipTMAStore) {
+                            #pragma unroll
+                            for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
+                                auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * kEpiSubM;
+                                const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
+                                    n_base + ts * kTMAStoreInnerDim);
+                                if constexpr (kIsBatchedEpilogue) {
+                                    if constexpr (kWithAccumulation)
+                                        cute::SM90_TMA_REDUCE_ADD_3D::copy(
+                                            &tensor_map_cd, smem_src,
+                                            n_store, m_base + epi_m_start, batch_store_idx);
+                                    else
+                                        cute::SM90_TMA_STORE_3D::copy(
+                                            &tensor_map_cd, smem_src,
+                                            n_store, m_base + epi_m_start, batch_store_idx);
+                                } else {
+                                    cute::SM90_TMA_STORE_2D::copy(
                                         &tensor_map_cd, smem_src,
-                                        n_store, m_base + epi_m_start, batch_store_idx);
-                                else
-                                    cute::SM90_TMA_STORE_3D::copy(
-                                        &tensor_map_cd, smem_src,
-                                        n_store, m_base + epi_m_start, batch_store_idx);
-                            } else {
-                                cute::SM90_TMA_STORE_2D::copy(
-                                    &tensor_map_cd, smem_src,
-                                    n_store, m_base + epi_m_start);
+                                        n_store, m_base + epi_m_start);
+                                }
                             }
+                            cute::tma_store_arrive();
                         }
-                        cute::tma_store_arrive();
                     }
                 } // ms loop
             } else {
@@ -1340,7 +1416,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         } // persistent loop
 
         // Final TMA store drain
-        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1) {
+        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1 and
+                      not kAblationSkipEpilogueStore and not kAblationSkipTMAStore) {
             if (math_warp_idx == 0 and lane_idx == 0)
                 cute::tma_store_wait<0>();
         }
@@ -1349,6 +1426,960 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Signal completion for PDL (allows dependent reduce kernel to start)
     if constexpr (kSplitKFactor > 1) {
         cudaTriggerProgrammaticLaunchCompletion();
+    }
+
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_DEVICE_ASSERT(false and "This kernel only supports sm_120a");
+#endif
+}
+
+template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t kGranKA, uint32_t kGranKB,
+          uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
+          uint32_t kSwizzleCDMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumSMs,
+          GemmType kGemmType, bool kWithAccumulation,
+          typename cd_dtype_t,
+          typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
+          bool kIsFP4 = false,
+          bool kBIsFP4 = false,
+          bool kAIsFP4 = false,
+          bool kBKMajor = true,
+          bool kKGroupedConstantStride = false,
+          uint32_t kEpiSubM = BLOCK_M,
+          uint32_t kAblationMode = 0,
+          uint32_t kSplitKFactor = 1>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm120_fp8_fp4_gemm_1d1d_clean_ablation_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
+                                            __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+                                            int* grouped_layout,
+                                            cute::TmaDescriptor* tensor_map_buffer,
+                                            float* gmem_workspace,
+                                            uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                                            uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
+                                            const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
+                                            const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
+                                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
+                                            const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
+    namespace sm120_mma = mma::sm120;
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+    static constexpr uint32_t MMA_M = 16;
+    static constexpr uint32_t MMA_N = 8;
+    static constexpr uint32_t MMA_K = sm120_mma::FP8_MMA_K;
+    static constexpr uint32_t MMA_ACCUM = 4;
+
+    DG_STATIC_ASSERT(SHAPE_N == 3072 and SHAPE_K == 2048, "Clean ablation kernel requires compiled N=3072,K=2048");
+    DG_STATIC_ASSERT(SHAPE_M == 0 or SHAPE_M == 3072, "Clean ablation kernel only supports M=3072");
+    DG_STATIC_ASSERT(kGranKA == 128 and kGranKB == 128, "Clean ablation kernel only supports gran_k=128");
+    DG_STATIC_ASSERT(kNumGroups == 1 and kGemmType == GemmType::Normal, "Clean ablation kernel only supports normal GEMM");
+    DG_STATIC_ASSERT(not kWithAccumulation and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
+                     "Clean ablation kernel only supports BF16 D without accumulation");
+    DG_STATIC_ASSERT(not kIsFP4 and not kBIsFP4 and not kAIsFP4 and kBKMajor and not kKGroupedConstantStride,
+                     "Clean ablation kernel only supports FP8xFP8 K-major inputs");
+    static constexpr bool kCleanTile192x96 =
+        BLOCK_M == 192 and BLOCK_N == 96 and kSwizzleCDMode == 64 and
+        ((BLOCK_K == 64 and kNumStages == 4) or (BLOCK_K == 128 and kNumStages == 2));
+    static constexpr bool kCleanTile128x128 =
+        BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64 and
+        kSwizzleCDMode == 128 and kNumStages == 4;
+    DG_STATIC_ASSERT(kCleanTile192x96 or kCleanTile128x128,
+                     "Clean ablation kernel only supports 192x96x64 stage4, 192x96x128 stage2, or 128x128x64 stage4 tiles");
+    DG_STATIC_ASSERT(kSwizzleAMode == kSwizzleBMode and (kSwizzleAMode == 64 or kSwizzleAMode == 128),
+                     "Clean ablation kernel requires matching A/B swizzle 64 or 128");
+    DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads == 256,
+                     "Clean ablation kernel requires 128/256 TMA/math threads");
+    DG_STATIC_ASSERT((kEpiSubM == 48 or kEpiSubM == 64 or kEpiSubM == 96) and
+                     kSplitKFactor == 1 and BLOCK_M % kEpiSubM == 0,
+                     "Clean ablation kernel requires kEpiSubM=48/64/96 and split_k=1");
+
+    static constexpr uint32_t kAblationNoTMAStore = 1u << 0;
+    static constexpr uint32_t kAblationNoEpilogueStore = 1u << 1;
+    static constexpr uint32_t kAblationNoMMA = 1u << 2;
+    static constexpr uint32_t kAblationNoSFLoad = 1u << 3;
+    static constexpr uint32_t kAblationNoABTMALoad = 1u << 4;
+    static constexpr uint32_t kAblationNoFragmentLoad = 1u << 5;
+    static constexpr uint32_t kAblationNoSFTMALoad = 1u << 6;
+    static constexpr uint32_t kAblationNoKPipeline = 1u << 7;
+    static constexpr uint32_t kAblationValidMask = kAblationNoTMAStore |
+        kAblationNoEpilogueStore | kAblationNoMMA | kAblationNoSFLoad |
+        kAblationNoABTMALoad | kAblationNoFragmentLoad |
+        kAblationNoSFTMALoad | kAblationNoKPipeline;
+    static constexpr bool kAblationSkipTMAStore = (kAblationMode & kAblationNoTMAStore) != 0;
+    static constexpr bool kAblationSkipEpilogueStore = (kAblationMode & kAblationNoEpilogueStore) != 0;
+    static constexpr bool kAblationSkipMMA = (kAblationMode & kAblationNoMMA) != 0;
+    static constexpr bool kAblationSkipABTMALoad = (kAblationMode & kAblationNoABTMALoad) != 0;
+    static constexpr bool kAblationSkipFragmentLoad = (kAblationMode & kAblationNoFragmentLoad) != 0;
+    static constexpr bool kAblationSkipSFTMALoad = (kAblationMode & kAblationNoSFTMALoad) != 0;
+    static constexpr bool kAblationSkipKPipeline = (kAblationMode & kAblationNoKPipeline) != 0;
+    static constexpr uint32_t kAblationScheduleBReuse16 = 1u << 8;
+    static constexpr bool kAblationScheduleBReuse16Enabled =
+        (kAblationMode & kAblationScheduleBReuse16) != 0;
+    static constexpr uint32_t kAblationSFTileCache = 1u << 9;
+    static constexpr bool kAblationSFTileCacheEnabled =
+        (kAblationMode & kAblationSFTileCache) != 0;
+    static constexpr uint32_t kAblationNoATMALoad = 1u << 10;
+    static constexpr uint32_t kAblationNoBTMALoad = 1u << 11;
+    static constexpr uint32_t kAblationCTAParityAB = 1u << 12;
+    static constexpr bool kAblationCTAParityABEnabled =
+        (kAblationMode & kAblationCTAParityAB) != 0;
+    static constexpr uint32_t kAblationEpiPrepack = 1u << 13;
+    static constexpr bool kAblationEpiPrepackEnabled =
+        (kAblationMode & kAblationEpiPrepack) != 0;
+    static constexpr uint32_t kAblationTMAStoreRing = 1u << 14;
+    static constexpr bool kAblationTMAStoreRingEnabled =
+        (kAblationMode & kAblationTMAStoreRing) != 0;
+    static constexpr uint32_t kAblationEpiPrepackOneMT = 1u << 15;
+    static constexpr bool kAblationEpiPrepackOneMTEnabled =
+        (kAblationMode & kAblationEpiPrepackOneMT) != 0;
+    static constexpr uint32_t kAblationTMAStoreRotating4 = 1u << 16;
+    static constexpr bool kAblationTMAStoreRotating4Enabled =
+        (kAblationMode & kAblationTMAStoreRotating4) != 0;
+    static constexpr uint32_t kAblationDirectGlobalStore = 1u << 17;
+    static constexpr bool kAblationDirectGlobalStoreEnabled =
+        (kAblationMode & kAblationDirectGlobalStore) != 0;
+    static constexpr uint32_t kAblationEpi48DoubleBuffer = 1u << 18;
+    static constexpr bool kAblationEpi48DoubleBufferEnabled =
+        (kAblationMode & kAblationEpi48DoubleBuffer) != 0;
+    static constexpr uint32_t kAblationSFTileCacheOneStage = 1u << 19;
+    static constexpr bool kAblationSFTileCacheOneStageEnabled =
+        (kAblationMode & kAblationSFTileCacheOneStage) != 0;
+    static constexpr uint32_t kAblationEpi48DoubleBufferWait0 = 1u << 20;
+    static constexpr bool kAblationEpi48DoubleBufferWait0Enabled =
+        (kAblationMode & kAblationEpi48DoubleBufferWait0) != 0;
+    static constexpr bool kAblationSkipATMALoad = kAblationSkipABTMALoad or
+        (kAblationMode & kAblationNoATMALoad) != 0;
+    static constexpr bool kAblationSkipBTMALoad = kAblationSkipABTMALoad or
+        (kAblationMode & kAblationNoBTMALoad) != 0;
+    static constexpr bool kAblationSkipSFLoad = ((kAblationMode & kAblationNoSFLoad) != 0) or
+        kAblationSkipSFTMALoad or kAblationSkipKPipeline;
+    static_assert((kAblationMode & ~(kAblationValidMask | kAblationScheduleBReuse16 |
+                                     kAblationSFTileCache | kAblationNoATMALoad |
+                                     kAblationNoBTMALoad | kAblationCTAParityAB |
+                                     kAblationEpiPrepack | kAblationTMAStoreRing |
+                                     kAblationEpiPrepackOneMT | kAblationTMAStoreRotating4 |
+                                     kAblationDirectGlobalStore | kAblationEpi48DoubleBuffer |
+                                     kAblationSFTileCacheOneStage | kAblationEpi48DoubleBufferWait0)) == 0,
+                  "Invalid SM120 FP8 clean ablation mode");
+
+    static constexpr uint32_t kNumSFAStagesPerLoad = (4 * kGranKA) / BLOCK_K;
+    static constexpr uint32_t kNumSFBStagesPerLoad = (4 * kGranKB) / BLOCK_K;
+    static constexpr uint32_t kSFTileKBlocks = kNumSFAStagesPerLoad;
+    static constexpr uint32_t kNumKBlocks = 2048 / BLOCK_K;
+    static constexpr uint32_t kNumSFTiles = kNumKBlocks / kSFTileKBlocks;
+    DG_STATIC_ASSERT(kNumSFAStagesPerLoad == kNumSFBStagesPerLoad and
+                     kNumKBlocks % kSFTileKBlocks == 0 and kNumSFTiles == 4,
+                     "Clean ablation kernel expects exactly four SF tiles");
+    DG_STATIC_ASSERT(not kAblationSFTileCacheEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and (kEpiSubM == 48 or kEpiSubM == 64)),
+                     "SF tile cache only supports the 192x96x64 stage4 epilogue48/64 kernel");
+    DG_STATIC_ASSERT(not kAblationSFTileCacheOneStageEnabled or
+                     (kAblationSFTileCacheEnabled and BLOCK_M == 192 and BLOCK_N == 96 and
+                      BLOCK_K == 64 and kNumStages == 4 and kEpiSubM == 48),
+                     "One-stage SF tile cache only supports the epilogue48 capacity control");
+    DG_STATIC_ASSERT(not kAblationEpi48DoubleBufferEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 48),
+                     "Epilogue48 double buffer only supports the 192x96x64 stage4 kernel");
+    DG_STATIC_ASSERT(not kAblationEpi48DoubleBufferEnabled or
+                     not kAblationSFTileCacheEnabled or
+                     kAblationSFTileCacheOneStageEnabled,
+                     "Epilogue48 double buffer exceeds SM120 capacity with a two-stage SF cache");
+    DG_STATIC_ASSERT(not kAblationEpi48DoubleBufferWait0Enabled or
+                     kAblationEpi48DoubleBufferEnabled,
+                     "Serialized epilogue48 double buffer requires the double-buffer mode");
+    DG_STATIC_ASSERT(not kAblationCTAParityABEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 64),
+                     "CTA-parity A/B issue order only supports the 192x96x64 stage4 epilogue64 kernel");
+    DG_STATIC_ASSERT(not kAblationEpiPrepackEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 64),
+                     "Epilogue prepack only supports the 192x96x64 stage4 epilogue64 kernel");
+    DG_STATIC_ASSERT(not kAblationTMAStoreRingEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 64),
+                     "TMA store ring only supports the 192x96x64 stage4 epilogue64 kernel");
+    DG_STATIC_ASSERT(not kAblationEpiPrepackOneMTEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 64),
+                     "One-M-tile epilogue prepack only supports the 192x96x64 stage4 epilogue64 kernel");
+    DG_STATIC_ASSERT(not kAblationTMAStoreRotating4Enabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 64),
+                     "Rotating four-atom TMA store only supports the 192x96x64 stage4 epilogue64 kernel");
+    DG_STATIC_ASSERT(not kAblationDirectGlobalStoreEnabled or
+                     (BLOCK_M == 192 and BLOCK_N == 96 and BLOCK_K == 64 and
+                      kNumStages == 4 and kEpiSubM == 64),
+                     "Direct global store only supports the 192x96x64 stage4 epilogue64 kernel");
+    DG_STATIC_ASSERT(static_cast<int>(kAblationEpiPrepackEnabled) +
+                         static_cast<int>(kAblationTMAStoreRingEnabled) +
+                         static_cast<int>(kAblationEpiPrepackOneMTEnabled) +
+                         static_cast<int>(kAblationTMAStoreRotating4Enabled) +
+                         static_cast<int>(kAblationDirectGlobalStoreEnabled) +
+                         static_cast<int>(kAblationEpi48DoubleBufferEnabled) <= 1,
+                     "Epilogue overlap modes are separate experiments");
+
+    static constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
+    static constexpr uint32_t kNTiles = BLOCK_N / MMA_N;
+    static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
+    static constexpr uint32_t kNWarps = 2;
+    static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
+    static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
+    static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
+    static constexpr uint32_t kAccumPerWarp = kMTilesPerWarp * kNTilesPerWarp * MMA_ACCUM;
+    DG_STATIC_ASSERT(kKSteps % 2 == 0 and
+                     ((kMTilesPerWarp == 3 and kNTilesPerWarp == 6 and kAccumPerWarp == 72) or
+                      (kMTilesPerWarp == 2 and kNTilesPerWarp == 8 and kAccumPerWarp == 64)),
+                     "Unexpected clean ablation warp tile geometry");
+
+    static constexpr uint32_t kTMARegisters = 40;
+    static constexpr uint32_t kMMARegisters = 232;
+    static constexpr uint32_t kSwizzleCDShift = 7 - __builtin_ctz(kSwizzleCDMode);
+    static constexpr uint32_t kSwizzleCDMask = kSwizzleCDMode / 16 - 1;
+    static constexpr uint32_t kTMAStoreInnerDim = kSwizzleCDMode / sizeof(cd_dtype_t);
+    static constexpr uint32_t kNumTMAStores = BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode;
+    static constexpr uint32_t kNumEpiMSubs = BLOCK_M / kEpiSubM;
+    static constexpr uint32_t kTMAStoreAtomBytes = kSwizzleCDMode * kEpiSubM;
+    static constexpr uint32_t kTMAStoreAtomsPerRingStage = 2;
+    static constexpr uint32_t kNumTMAStoreRingStages = 2;
+    static constexpr uint32_t kNumTMAStoreAtoms = kNumEpiMSubs * kNumTMAStores;
+    static constexpr uint32_t kNumTMAStoreRingGroups =
+        (kNumTMAStoreAtoms + kTMAStoreAtomsPerRingStage - 1) / kTMAStoreAtomsPerRingStage;
+    static constexpr uint32_t kTMAStoreRingStageBytes =
+        kTMAStoreAtomsPerRingStage * kTMAStoreAtomBytes;
+    static constexpr uint32_t SMEM_D = kAblationEpi48DoubleBufferEnabled
+        ? 2 * kNumTMAStores * kTMAStoreAtomBytes
+        : (kAblationTMAStoreRingEnabled or kAblationTMAStoreRotating4Enabled)
+        ? kNumTMAStoreRingStages * kTMAStoreRingStageBytes
+        : kNumTMAStores * kTMAStoreAtomBytes;
+    DG_STATIC_ASSERT(not kAblationTMAStoreRotating4Enabled or
+                     (kNumTMAStores == 3 and kTMAStoreAtomBytes == 4096 and
+                      SMEM_D == 4 * kTMAStoreAtomBytes),
+                     "Rotating TMA store requires three output atoms and four physical slots");
+
+    static constexpr uint32_t SMEM_A = BLOCK_M * BLOCK_K;
+    static constexpr uint32_t SMEM_B = BLOCK_N * BLOCK_K;
+    static constexpr uint32_t SMEM_SFA = math::constexpr_align(static_cast<uint32_t>(BLOCK_M * sizeof(int32_t)), 128u);
+    static constexpr uint32_t SMEM_SFB = math::constexpr_align(static_cast<uint32_t>(BLOCK_N * sizeof(int32_t)), 128u);
+    static constexpr uint32_t TMA_A_BYTES = SMEM_A;
+    static constexpr uint32_t TMA_B_BYTES = SMEM_B;
+    static constexpr uint32_t TMA_SFA_BYTES = BLOCK_M * sizeof(int32_t);
+    static constexpr uint32_t TMA_SFB_BYTES = BLOCK_N * sizeof(int32_t);
+    static constexpr uint32_t SMEM_TMA_AB_BYTES_ABLATED =
+        (kAblationSkipATMALoad ? 0u : TMA_A_BYTES) +
+        (kAblationSkipBTMALoad ? 0u : TMA_B_BYTES);
+    static constexpr uint32_t SMEM_TMA_SF_BYTES_ABLATED =
+        (kAblationSkipSFTMALoad or kAblationSFTileCacheEnabled) ? 0u :
+        (TMA_SFA_BYTES + TMA_SFB_BYTES);
+    static constexpr uint32_t SMEM_TMA_BYTES_ABLATED = SMEM_TMA_AB_BYTES_ABLATED + SMEM_TMA_SF_BYTES_ABLATED;
+    static constexpr uint32_t kNumSFTileCacheStages = kAblationSFTileCacheOneStageEnabled ? 1 : 2;
+    static constexpr uint32_t SMEM_TMA_SF_TILE_BYTES =
+        kNumSFTiles * (TMA_SFA_BYTES + TMA_SFB_BYTES);
+
+    shape_m = 3072;
+    shape_n = 3072;
+    shape_k = 2048;
+
+    const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    const uint32_t lane_idx = threadIdx.x % 32;
+
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto smem_d_base = reinterpret_cast<cd_dtype_t*>(smem_buffer);
+
+    constexpr uint32_t PIPE_BASE = SMEM_D;
+    auto smem_a = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<char*>(smem_buffer + PIPE_BASE + s * SMEM_A);
+    });
+    auto smem_b = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<char*>(smem_buffer + PIPE_BASE + kNumStages * SMEM_A + s * SMEM_B);
+    });
+    constexpr uint32_t SF_BASE = PIPE_BASE + kNumStages * (SMEM_A + SMEM_B);
+    constexpr uint32_t kNumSFStorageStages = kAblationSFTileCacheEnabled
+        ? kNumSFTileCacheStages * kNumSFTiles : kNumStages;
+    auto smem_sfa = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<char*>(smem_buffer + SF_BASE + s * SMEM_SFA);
+    });
+    auto smem_sfb = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<char*>(smem_buffer + SF_BASE + kNumSFStorageStages * SMEM_SFA + s * SMEM_SFB);
+    });
+    constexpr uint32_t BAR_BASE = SF_BASE + kNumSFStorageStages * (SMEM_SFA + SMEM_SFB);
+    auto full_barriers = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<Barrier*>(smem_buffer + BAR_BASE + s * sizeof(Barrier));
+    });
+    auto empty_barriers = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<Barrier*>(smem_buffer + BAR_BASE + (kNumStages + s) * sizeof(Barrier));
+    });
+    constexpr uint32_t SF_BAR_BASE = BAR_BASE + 2 * kNumStages * sizeof(Barrier);
+    constexpr uint32_t SMEM_LAYOUT_BYTES = SF_BAR_BASE +
+        (kAblationSFTileCacheEnabled ? 2 * kNumSFTileCacheStages * sizeof(Barrier) : 0);
+    DG_STATIC_ASSERT(SMEM_LAYOUT_BYTES <= 101376,
+                     "Clean ablation shared-memory layout exceeds SM120 capacity");
+    auto sf_full_barriers = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<Barrier*>(smem_buffer + SF_BAR_BASE + s * sizeof(Barrier));
+    });
+    auto sf_empty_barriers = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<Barrier*>(smem_buffer + SF_BAR_BASE +
+            (kNumSFTileCacheStages + s) * sizeof(Barrier));
+    });
+
+    if (warp_idx == 0 and cute::elect_one_sync()) {
+        cute::prefetch_tma_descriptor(&tensor_map_a_base);
+        cute::prefetch_tma_descriptor(&tensor_map_b_base);
+        cute::prefetch_tma_descriptor(&tensor_map_sfa);
+        cute::prefetch_tma_descriptor(&tensor_map_sfb);
+        cute::prefetch_tma_descriptor(&tensor_map_cd);
+    }
+    __syncwarp();
+
+    if (warp_idx == 1 and cute::elect_one_sync()) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumStages; ++i) {
+            full_barriers[i]->init(1);
+            empty_barriers[i]->init(kNumMathWarps);
+        }
+        if constexpr (kAblationSFTileCacheEnabled) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumSFTileCacheStages; ++i) {
+                sf_full_barriers[i]->init(1);
+                sf_empty_barriers[i]->init(kNumMathWarps);
+            }
+        }
+        cutlass::arch::fence_barrier_init();
+    }
+    __syncthreads();
+
+    cudaGridDependencySynchronize();
+
+    uint32_t m_block_idx, n_block_idx;
+    static constexpr uint32_t kSFKAlignment = kGranKA * 4;
+    static constexpr uint32_t kSchedule1DBlocksPerGroup = kAblationScheduleBReuse16Enabled ? 16u :
+        sched::get_num_1d_blocks_per_group<GemmType::Normal, BLOCK_M, BLOCK_N, kNumSMs, false>();
+    auto scheduler = sched::Scheduler<GemmType::Normal, BLOCK_M, BLOCK_N, kNumGroups, 1, false,
+        kNumSMs, kSFKAlignment, kSchedule1DBlocksPerGroup, kSplitKFactor>(
+        shape_m, shape_n, shape_k, grouped_layout);
+    const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
+        return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
+    };
+    const auto get_sf_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
+        return {iter_idx % kNumSFTileCacheStages, (iter_idx / kNumSFTileCacheStages) & 1};
+    };
+
+    if (warp_idx >= kNumMathWarps) {
+        cutlass::arch::warpgroup_reg_dealloc<kTMARegisters>();
+
+        const bool is_tma_leader = (warp_idx == kNumMathWarps and lane_idx == 0);
+        uint32_t tma_iter_idx = 0;
+        uint32_t tma_tile_iter_idx = 0;
+        if (is_tma_leader) {
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                const uint32_t m_idx = m_block_idx * BLOCK_M;
+                const uint32_t n_idx = n_block_idx * BLOCK_N;
+                if constexpr (not kAblationSkipKPipeline) {
+                    if constexpr (kAblationSFTileCacheEnabled and not kAblationSkipSFTMALoad) {
+                        CUTE_TIE_DECL(get_sf_pipeline(tma_tile_iter_idx), sf_stage, sf_phase);
+                        sf_empty_barriers[sf_stage]->wait(sf_phase ^ 1);
+                        const uint32_t sf_smem_stage = sf_stage * kNumSFTiles;
+                        sf_full_barriers[sf_stage]->arrive_and_expect_tx(SMEM_TMA_SF_TILE_BYTES);
+                        tma::copy<BLOCK_M, kNumSFTiles, 0>(
+                            &tensor_map_sfa, sf_full_barriers[sf_stage], smem_sfa[sf_smem_stage], m_idx, 0, 1);
+                        tma::copy<BLOCK_N, kNumSFTiles, 0>(
+                            &tensor_map_sfb, sf_full_barriers[sf_stage], smem_sfb[sf_smem_stage], n_idx, 0, 1);
+                    }
+                    ++tma_tile_iter_idx;
+
+                    #pragma unroll
+                    for (uint32_t kb = 0; kb < kNumKBlocks; ++kb) {
+                        CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
+                        empty_barriers[s]->wait(p ^ 1);
+
+                        const uint32_t k_idx = kb * BLOCK_K;
+                        const uint32_t sf_k = kb / kSFTileKBlocks;
+                        if constexpr (not kAblationSkipSFTMALoad and not kAblationSFTileCacheEnabled) {
+                            tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_idx, sf_k, 1);
+                            tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_idx, sf_k, 1);
+                        }
+                        if constexpr (kAblationCTAParityABEnabled) {
+                            if ((blockIdx.x & 1) != 0) {
+                                if constexpr (not kAblationSkipBTMALoad)
+                                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, char, false>(
+                                        &tensor_map_b_base, full_barriers[s], smem_b[s], k_idx, n_idx, 1, 0);
+                                if constexpr (not kAblationSkipATMALoad)
+                                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, char, false>(
+                                        &tensor_map_a_base, full_barriers[s], smem_a[s], k_idx, m_idx, 1, 0);
+                            } else {
+                                if constexpr (not kAblationSkipATMALoad)
+                                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, char, false>(
+                                        &tensor_map_a_base, full_barriers[s], smem_a[s], k_idx, m_idx, 1, 0);
+                                if constexpr (not kAblationSkipBTMALoad)
+                                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, char, false>(
+                                        &tensor_map_b_base, full_barriers[s], smem_b[s], k_idx, n_idx, 1, 0);
+                            }
+                        } else {
+                            if constexpr (not kAblationSkipATMALoad)
+                                tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, char, false>(
+                                    &tensor_map_a_base, full_barriers[s], smem_a[s], k_idx, m_idx, 1, 0);
+                            if constexpr (not kAblationSkipBTMALoad)
+                                tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, char, false>(
+                                    &tensor_map_b_base, full_barriers[s], smem_b[s], k_idx, n_idx, 1, 0);
+                        }
+                        if constexpr (SMEM_TMA_BYTES_ABLATED > 0)
+                            full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES_ABLATED);
+                        else
+                            full_barriers[s]->arrive();
+                    }
+                }
+            }
+        }
+    } else {
+        cutlass::arch::warpgroup_reg_alloc<kMMARegisters>();
+
+        const uint32_t math_warp_idx = warp_idx;
+        const uint32_t group_id = lane_idx / 4;
+        const uint32_t thread_id = lane_idx % 4;
+        const uint32_t warp_m = math_warp_idx / kNWarps;
+        const uint32_t warp_n = math_warp_idx % kNWarps;
+        const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
+        const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
+
+        float accum[kAccumPerWarp];
+        uint32_t iter_idx = 0;
+        uint32_t math_tile_iter_idx = 0;
+        uint32_t tma_store_ring_stage = 0;
+        uint32_t tma_store_rotating_free_slot = 0;
+        uint32_t tma_store_epi48_stage = 0;
+
+        while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            CUTE_TIE_DECL(get_sf_pipeline(math_tile_iter_idx), sf_stage, sf_phase);
+            ++math_tile_iter_idx;
+            if constexpr (kAblationSFTileCacheEnabled and not kAblationSkipKPipeline and
+                          not kAblationSkipSFTMALoad)
+                sf_full_barriers[sf_stage]->wait(sf_phase);
+
+            if constexpr (not kAblationSkipMMA or not kAblationSkipEpilogueStore) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kAccumPerWarp; ++i)
+                    accum[i] = 0.f;
+            }
+
+            if constexpr (not kAblationSkipKPipeline) {
+                uint32_t sf_packed_a[kMTilesPerWarp];
+                uint32_t sf_packed_b[kNTilesPerWarp];
+                sm120::SwizzleContext<kSwizzleAMode> a_ctx[kMTilesPerWarp];
+                sm120::SwizzleContext<kSwizzleBMode> b_ctx[kNTilesPerWarp];
+
+                #pragma unroll
+                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                    const int a_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + (m_tile_base + mt) * MMA_M;
+                    a_ctx[mt].init(a_row, BLOCK_K);
+                }
+                #pragma unroll
+                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                    const int b_row = (lane_idx & 7) + (n_tile_base + nt) * MMA_N;
+                    b_ctx[nt].init(b_row, BLOCK_K);
+                }
+
+                #pragma unroll
+                for (uint32_t sf_tile = 0; sf_tile < kNumSFTiles; ++sf_tile) {
+                    cute::for_each(cute::make_int_sequence<kSFTileKBlocks>{}, [&](auto kb_inner_ic) {
+                        constexpr uint32_t kb_inner = kb_inner_ic;
+                        CUTE_TIE_DECL(get_pipeline(iter_idx++), stage, phase);
+                        full_barriers[stage]->wait(phase);
+
+                        uint32_t b_nt[kNTilesPerWarp][4];
+                        uint32_t a_frag[2][kMTilesPerWarp][4];
+                        uint8_t sfb_hoisted[kNTilesPerWarp];
+                        uint8_t sfa_hoisted[kMTilesPerWarp];
+
+                        if constexpr (kAblationSkipSFLoad) {
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                sfb_hoisted[nt] = 0;
+                            #pragma unroll
+                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                sfa_hoisted[mt] = 0;
+                        } else {
+                            if (kb_inner == 0) {
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    const uint32_t sf_smem_stage = kAblationSFTileCacheEnabled
+                                        ? sf_stage * kNumSFTiles + sf_tile : stage;
+                                    sf_packed_b[nt] = sm120::load_sf(smem_sfb[sf_smem_stage],
+                                        (n_tile_base + nt) * MMA_N + group_id);
+                                }
+                                #pragma unroll
+                                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                                    const uint32_t sf_smem_stage = kAblationSFTileCacheEnabled
+                                        ? sf_stage * kNumSFTiles + sf_tile : stage;
+                                    sf_packed_a[mt] = sm120::load_sf(smem_sfa[sf_smem_stage],
+                                        (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8);
+                                }
+                            }
+
+                            constexpr uint32_t sf_byte = (kb_inner * BLOCK_K / kGranKA) % 4;
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                sfb_hoisted[nt] = sm120_mma::extract_sf_byte(sf_packed_b[nt], sf_byte);
+                            #pragma unroll
+                            for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                sfa_hoisted[mt] = sm120_mma::extract_sf_byte(sf_packed_a[mt], sf_byte);
+                        }
+
+                        static constexpr uint32_t kKStepPairs = kKSteps / 2;
+                        #pragma unroll
+                        for (uint32_t kp = 0; kp < kKStepPairs; ++kp) {
+                            const uint32_t ks_base = kp * 2;
+
+                            if constexpr (kAblationSkipFragmentLoad) {
+                                if constexpr (not kAblationSkipMMA) {
+                                    #pragma unroll
+                                    for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                                        #pragma unroll
+                                        for (uint32_t i = 0; i < 4; ++i) {
+                                            a_frag[0][mt][i] = 0;
+                                            a_frag[1][mt][i] = 0;
+                                        }
+                                    }
+                                    #pragma unroll
+                                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                        #pragma unroll
+                                        for (uint32_t i = 0; i < 4; ++i)
+                                            b_nt[nt][i] = 0;
+                                    }
+                                }
+                            } else {
+                                #pragma unroll
+                                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                    sm120::load_a_fragment(a_frag[0][mt], smem_a[stage], a_ctx[mt], lane_idx, ks_base, MMA_K);
+
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                    sm120::load_b_per_ntile_x4(b_nt[nt], smem_b[stage], b_ctx[nt], lane_idx, kp, MMA_K * 2);
+
+                                #pragma unroll
+                                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                    sm120::load_a_fragment(a_frag[1][mt], smem_a[stage], a_ctx[mt], lane_idx, ks_base + 1, MMA_K);
+                            }
+
+                            if constexpr (not kAblationSkipMMA) {
+                                if constexpr (kCleanTile192x96) {
+                                    #define DG_CLEAN_MMA_192(A_IDX, MI, NI, B0, B1) do { \
+                                        float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[((MI) * 6 + (NI)) * MMA_ACCUM]); \
+                                        sm120_mma::fp8_mma_block_scaled(d, a_frag[A_IDX][MI], b_nt[NI][B0], b_nt[NI][B1], \
+                                                                        sfa_hoisted[MI], sfb_hoisted[NI]); \
+                                    } while (false)
+
+                                    DG_CLEAN_MMA_192(0, 0, 0, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 0, 1, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 0, 2, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 0, 3, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 0, 4, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 0, 5, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 1, 0, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 1, 1, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 1, 2, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 1, 3, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 1, 4, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 1, 5, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 2, 0, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 2, 1, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 2, 2, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 2, 3, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 2, 4, 0, 1);
+                                    DG_CLEAN_MMA_192(0, 2, 5, 0, 1);
+
+                                    DG_CLEAN_MMA_192(1, 0, 0, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 0, 1, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 0, 2, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 0, 3, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 0, 4, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 0, 5, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 1, 0, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 1, 1, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 1, 2, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 1, 3, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 1, 4, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 1, 5, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 2, 0, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 2, 1, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 2, 2, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 2, 3, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 2, 4, 2, 3);
+                                    DG_CLEAN_MMA_192(1, 2, 5, 2, 3);
+
+                                    #undef DG_CLEAN_MMA_192
+                                } else {
+                                    #pragma unroll
+                                    for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                                        #pragma unroll
+                                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                            float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
+                                            sm120_mma::fp8_mma_block_scaled(d, a_frag[0][mt], b_nt[nt][0], b_nt[nt][1],
+                                                                            sfa_hoisted[mt], sfb_hoisted[nt]);
+                                        }
+                                    }
+
+                                    #pragma unroll
+                                    for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                                        #pragma unroll
+                                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                            float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
+                                            sm120_mma::fp8_mma_block_scaled(d, a_frag[1][mt], b_nt[nt][2], b_nt[nt][3],
+                                                                            sfa_hoisted[mt], sfb_hoisted[nt]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (lane_idx == 0)
+                            empty_barriers[stage]->arrive();
+                    });
+                }
+            }
+
+            if constexpr (kAblationSFTileCacheEnabled and not kAblationSkipKPipeline and
+                          not kAblationSkipSFTMALoad) {
+                __syncwarp();
+                if (lane_idx == 0)
+                    sf_empty_barriers[sf_stage]->arrive();
+            }
+
+            if constexpr (kAblationSkipEpilogueStore) {
+                if constexpr (not kAblationSkipMMA) if (lane_idx == 0) {
+                    float sink = 0.f;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAccumPerWarp; i += MMA_ACCUM)
+                        sink += accum[i];
+                    asm volatile("{ .reg .pred p; setp.nan.f32 p, %0, %0; @p nanosleep.u32 1; }" :: "f"(sink));
+                }
+            } else {
+                const uint32_t m_base = m_block_idx * BLOCK_M;
+                const uint32_t n_base = n_block_idx * BLOCK_N;
+
+                if constexpr (kAblationDirectGlobalStoreEnabled and not kAblationSkipTMAStore) {
+                    #pragma unroll
+                    for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                        #pragma unroll
+                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                            const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                            const uint32_t p0 = math::cast_into_bf16_and_pack(accum[ai + 0], accum[ai + 1]);
+                            const uint32_t p1 = math::cast_into_bf16_and_pack(accum[ai + 2], accum[ai + 3]);
+                            const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
+                            const uint32_t row1 = row0 + 8;
+                            const uint32_t col = n_base + (n_tile_base + nt) * MMA_N + thread_id * 2;
+                            const int64_t idx0 = static_cast<int64_t>(row0) * stride_cd_m + col;
+                            const int64_t idx1 = static_cast<int64_t>(row1) * stride_cd_m + col;
+                            *reinterpret_cast<uint32_t*>(gmem_d + idx0) = p0;
+                            *reinterpret_cast<uint32_t*>(gmem_d + idx1) = p1;
+                        }
+                    }
+                } else if constexpr (kAblationTMAStoreRotating4Enabled) {
+                    #pragma unroll
+                    for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
+                        const uint32_t epi_m_start = ms * kEpiSubM;
+                        const uint32_t free_slot = tma_store_rotating_free_slot;
+
+                        // This atom is not a source of the preceding async group, so it can
+                        // be populated before waiting for the other three atoms to retire.
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
+                            const uint32_t local_row1 = local_row0 + 8;
+                            if (local_row0 >= epi_m_start and local_row0 < epi_m_start + kEpiSubM) {
+                                const uint32_t sub_row0 = local_row0 - epi_m_start;
+                                const uint32_t sub_row1 = sub_row0 + 8;
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    const uint32_t local_col = (n_tile_base + nt) * MMA_N + thread_id * 2;
+                                    const uint32_t sub_tile = local_col / kTMAStoreInnerDim;
+                                    if (sub_tile == 0) {
+                                        const uint32_t col_byte = local_col * sizeof(cd_dtype_t);
+                                        const uint32_t sw0 = col_byte ^
+                                            (((sub_row0 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                        const uint32_t sw1 = col_byte ^
+                                            (((sub_row1 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                        cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                        cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                        auto* smem_atom = reinterpret_cast<char*>(smem_d_base) +
+                                            free_slot * kTMAStoreAtomBytes;
+                                        *reinterpret_cast<uint32_t*>(smem_atom + sub_row0 * kSwizzleCDMode + sw0) =
+                                            *reinterpret_cast<const uint32_t*>(p0);
+                                        *reinterpret_cast<uint32_t*>(smem_atom + sub_row1 * kSwizzleCDMode + sw1) =
+                                            *reinterpret_cast<const uint32_t*>(p1);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (math_warp_idx == 0 and lane_idx == 0)
+                            cute::tma_store_wait<0>();
+                        cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
+                            const uint32_t local_row1 = local_row0 + 8;
+                            if (local_row0 >= epi_m_start and local_row0 < epi_m_start + kEpiSubM) {
+                                const uint32_t sub_row0 = local_row0 - epi_m_start;
+                                const uint32_t sub_row1 = sub_row0 + 8;
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    const uint32_t local_col = (n_tile_base + nt) * MMA_N + thread_id * 2;
+                                    const uint32_t sub_tile = local_col / kTMAStoreInnerDim;
+                                    if (sub_tile != 0) {
+                                        const uint32_t col_in_sub = local_col % kTMAStoreInnerDim;
+                                        const uint32_t col_byte = col_in_sub * sizeof(cd_dtype_t);
+                                        const uint32_t sw0 = col_byte ^
+                                            (((sub_row0 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                        const uint32_t sw1 = col_byte ^
+                                            (((sub_row1 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                        cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                        cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                        const uint32_t slot = (free_slot + sub_tile) & 3u;
+                                        auto* smem_atom = reinterpret_cast<char*>(smem_d_base) +
+                                            slot * kTMAStoreAtomBytes;
+                                        *reinterpret_cast<uint32_t*>(smem_atom + sub_row0 * kSwizzleCDMode + sw0) =
+                                            *reinterpret_cast<const uint32_t*>(p0);
+                                        *reinterpret_cast<uint32_t*>(smem_atom + sub_row1 * kSwizzleCDMode + sw1) =
+                                            *reinterpret_cast<const uint32_t*>(p1);
+                                    }
+                                }
+                            }
+                        }
+
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                        if (math_warp_idx == 0 and lane_idx == 0) {
+                            if constexpr (not kAblationSkipTMAStore) {
+                                #pragma unroll
+                                for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
+                                    const uint32_t slot = (free_slot + ts) & 3u;
+                                    auto* smem_src = reinterpret_cast<char*>(smem_d_base) +
+                                        slot * kTMAStoreAtomBytes;
+                                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_cd, smem_src,
+                                                                  n_base + ts * kTMAStoreInnerDim,
+                                                                  m_base + epi_m_start);
+                                }
+                                cute::tma_store_arrive();
+                            }
+                        }
+                        tma_store_rotating_free_slot = (free_slot + 3u) & 3u;
+                    }
+                } else if constexpr (kAblationTMAStoreRingEnabled) {
+                    cute::for_each(cute::make_int_sequence<kNumTMAStoreRingGroups>{}, [&](auto group_ic) {
+                        constexpr uint32_t store_group = group_ic;
+                        constexpr uint32_t first_atom = store_group * kTMAStoreAtomsPerRingStage;
+                        auto* smem_stage = reinterpret_cast<char*>(smem_d_base) +
+                            tma_store_ring_stage * kTMAStoreRingStageBytes;
+
+                        if (math_warp_idx == 0 and lane_idx == 0)
+                            cute::tma_store_wait<kNumTMAStoreRingStages - 1>();
+                        cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
+                            const uint32_t local_row1 = local_row0 + 8;
+                            const uint32_t epi_m_sub = local_row0 / kEpiSubM;
+                            const uint32_t sub_row0 = local_row0 % kEpiSubM;
+                            const uint32_t sub_row1 = sub_row0 + 8;
+
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                const uint32_t local_col = (n_tile_base + nt) * MMA_N + thread_id * 2;
+                                const uint32_t sub_tile = local_col / kTMAStoreInnerDim;
+                                const uint32_t atom = epi_m_sub * kNumTMAStores + sub_tile;
+                                if (atom >= first_atom and
+                                    atom < first_atom + kTMAStoreAtomsPerRingStage) {
+                                    const uint32_t atom_in_stage = atom - first_atom;
+                                    const uint32_t col_in_sub = local_col % kTMAStoreInnerDim;
+                                    const uint32_t col_byte_in_sub = col_in_sub * sizeof(cd_dtype_t);
+                                    const uint32_t sw0 = col_byte_in_sub ^
+                                        (((sub_row0 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                    const uint32_t sw1 = col_byte_in_sub ^
+                                        (((sub_row1 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                    const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                    cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                    cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                    auto* smem_atom = smem_stage + atom_in_stage * kTMAStoreAtomBytes;
+                                    *reinterpret_cast<uint32_t*>(smem_atom + sub_row0 * kSwizzleCDMode + sw0) =
+                                        *reinterpret_cast<const uint32_t*>(p0);
+                                    *reinterpret_cast<uint32_t*>(smem_atom + sub_row1 * kSwizzleCDMode + sw1) =
+                                        *reinterpret_cast<const uint32_t*>(p1);
+                                }
+                            }
+                        }
+
+                        cute::tma_store_fence();
+                        cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                        if (math_warp_idx == 0 and lane_idx == 0) {
+                            if constexpr (not kAblationSkipTMAStore) {
+                                cute::for_each(cute::make_int_sequence<kTMAStoreAtomsPerRingStage>{},
+                                              [&](auto atom_in_stage_ic) {
+                                    constexpr uint32_t atom_in_stage = atom_in_stage_ic;
+                                    constexpr uint32_t atom = first_atom + atom_in_stage;
+                                    if constexpr (atom < kNumTMAStoreAtoms) {
+                                        constexpr uint32_t epi_m_sub = atom / kNumTMAStores;
+                                        constexpr uint32_t sub_tile = atom % kNumTMAStores;
+                                        auto* smem_src = smem_stage + atom_in_stage * kTMAStoreAtomBytes;
+                                        cute::SM90_TMA_STORE_2D::copy(
+                                            &tensor_map_cd, smem_src,
+                                            n_base + sub_tile * kTMAStoreInnerDim,
+                                            m_base + epi_m_sub * kEpiSubM);
+                                    }
+                                });
+                                cute::tma_store_arrive();
+                            }
+                        }
+                        tma_store_ring_stage =
+                            (tma_store_ring_stage + 1) % kNumTMAStoreRingStages;
+                    });
+                } else {
+                    #pragma unroll
+                    for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
+                    const uint32_t epi_m_start = ms * kEpiSubM;
+                    const uint32_t epi_store_stage = kAblationEpi48DoubleBufferEnabled
+                        ? tma_store_epi48_stage : 0;
+
+                    uint32_t epi_packed[kMTilesPerWarp][kNTilesPerWarp][2];
+                    uint32_t epi_packed_one_mt[kNTilesPerWarp][2];
+                    int32_t epi_prepacked_mt = -1;
+                    if constexpr (kAblationEpiPrepackEnabled) {
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
+                            if (local_row0 >= epi_m_start and local_row0 < epi_m_start + kEpiSubM) {
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                    cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                    cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                    epi_packed[mt][nt][0] = *reinterpret_cast<const uint32_t*>(p0);
+                                    epi_packed[mt][nt][1] = *reinterpret_cast<const uint32_t*>(p1);
+                                }
+                            }
+                        }
+                    } else if constexpr (kAblationEpiPrepackOneMTEnabled) {
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
+                            if (epi_prepacked_mt < 0 and
+                                local_row0 >= epi_m_start and local_row0 < epi_m_start + kEpiSubM) {
+                                epi_prepacked_mt = static_cast<int32_t>(mt);
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                    cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                    cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                    epi_packed_one_mt[nt][0] = *reinterpret_cast<const uint32_t*>(p0);
+                                    epi_packed_one_mt[nt][1] = *reinterpret_cast<const uint32_t*>(p1);
+                                }
+                            }
+                        }
+                    }
+
+                    if (math_warp_idx == 0 and lane_idx == 0) {
+                        if constexpr (kAblationEpi48DoubleBufferEnabled and
+                                      not kAblationEpi48DoubleBufferWait0Enabled)
+                            cute::tma_store_wait<1>();
+                        else
+                            cute::tma_store_wait<0>();
+                    }
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                    #pragma unroll
+                    for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                        const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
+                        const uint32_t local_row1 = local_row0 + 8;
+                        if (local_row0 >= epi_m_start and local_row0 < epi_m_start + kEpiSubM) {
+                            const uint32_t sub_row0 = local_row0 - epi_m_start;
+                            const uint32_t sub_row1 = sub_row0 + 8;
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                const uint32_t local_col = (n_tile_base + nt) * MMA_N + thread_id * 2;
+                                const uint32_t sub_tile = local_col / kTMAStoreInnerDim;
+                                const uint32_t col_in_sub = local_col % kTMAStoreInnerDim;
+                                const uint32_t col_byte_in_sub = col_in_sub * sizeof(cd_dtype_t);
+                                const uint32_t sw0 = col_byte_in_sub ^ (((sub_row0 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                const uint32_t sw1 = col_byte_in_sub ^ (((sub_row1 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                auto* smem_d_bytes = reinterpret_cast<char*>(smem_d_base) +
+                                    epi_store_stage * kNumTMAStores * kTMAStoreAtomBytes;
+                                const uint32_t sub_base = sub_tile * kSwizzleCDMode * kEpiSubM;
+                                if constexpr (kAblationEpiPrepackEnabled) {
+                                    *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                        epi_packed[mt][nt][0];
+                                    *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                        epi_packed[mt][nt][1];
+                                } else if constexpr (kAblationEpiPrepackOneMTEnabled) {
+                                    if (static_cast<int32_t>(mt) == epi_prepacked_mt) {
+                                        *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                            epi_packed_one_mt[nt][0];
+                                        *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                            epi_packed_one_mt[nt][1];
+                                    } else {
+                                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                        cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                        cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                        *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                            *reinterpret_cast<const uint32_t*>(p0);
+                                        *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                            *reinterpret_cast<const uint32_t*>(p1);
+                                    }
+                                } else {
+                                    const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                                    cd_dtype_t p0[2] = {cd_dtype_t(accum[ai + 0]), cd_dtype_t(accum[ai + 1])};
+                                    cd_dtype_t p1[2] = {cd_dtype_t(accum[ai + 2]), cd_dtype_t(accum[ai + 3])};
+                                    *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                        *reinterpret_cast<const uint32_t*>(p0);
+                                    *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                        *reinterpret_cast<const uint32_t*>(p1);
+                                }
+                            }
+                        }
+                    }
+
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                    if (math_warp_idx == 0 and lane_idx == 0) {
+                        if constexpr (not kAblationSkipTMAStore) {
+                            #pragma unroll
+                            for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
+                                auto* smem_src = reinterpret_cast<char*>(smem_d_base) +
+                                    epi_store_stage * kNumTMAStores * kTMAStoreAtomBytes +
+                                    ts * kSwizzleCDMode * kEpiSubM;
+                                cute::SM90_TMA_STORE_2D::copy(&tensor_map_cd, smem_src,
+                                                              n_base + ts * kTMAStoreInnerDim,
+                                                              m_base + epi_m_start);
+                            }
+                            cute::tma_store_arrive();
+                        }
+                    }
+                    if constexpr (kAblationEpi48DoubleBufferEnabled)
+                        tma_store_epi48_stage ^= 1;
+                }
+                }
+            }
+        }
+
+        if constexpr (not kAblationSkipEpilogueStore and not kAblationSkipTMAStore and
+                      not kAblationDirectGlobalStoreEnabled) {
+            if (math_warp_idx == 0 and lane_idx == 0)
+                cute::tma_store_wait<0>();
+        }
     }
 
 #else
